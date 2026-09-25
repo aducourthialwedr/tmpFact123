@@ -222,3 +222,17 @@ def test_synthetic_recall(synthetic):
                            truth_debtors(synthetic.tables["imputation"], synthetic.tables["invoice"]), 0.99)["summary"]
     assert m["rappel_premier_passage"] >= 0.99
     assert m["précision_ferme"] >= 0.995
+
+
+def test_second_iban_of_a_debtor_routes_to_it():
+    from src.load.loader import consolidate_parties
+    data = dataset()
+    tables = data.tables
+    extra = tables["debtor"].iloc[[0]].copy()          # D1, second compte
+    extra["iban"] = "FR761112"
+    tables["debtor"] = pd.concat([tables["debtor"], extra], ignore_index=True)
+    tables["payment"] = pd.concat([tables["payment"], tables["payment"].iloc[[1]].assign(
+        payment_id="P9", iban_debtor="FR761112")], ignore_index=True)
+    consolidate_parties(tables, [])
+    a = allocate(data).payments.set_index("payment_id")
+    assert a.loc["P9", "iban_route"] == DEBTOR_DIRECT and a.loc["P9", "firm_debtor_id"] == "D1"

@@ -23,12 +23,13 @@ def load_interim(directory: str | Path, verify: bool = True) -> tuple[LoadedData
     if not meta_path.exists():
         raise InterimError(f"aucune sortie de l'étape 1 dans {d} : lancer d'abord le chargement")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    tables = {name: pd.read_parquet(d / f"{name}.parquet") for name in TABLES if (d / f"{name}.parquet").exists()}
+    names = [*TABLES, "party_iban"]
+    tables = {name: pd.read_parquet(d / f"{name}.parquet") for name in names if (d / f"{name}.parquet").exists()}
     journal = pd.read_parquet(d / "journal.parquet")
     if verify and journal_hash(journal) != meta["journal_sha256"]:
         raise InterimError("le journal ne correspond pas à son empreinte : relancer l'étape 1")
     mapped = meta.get("mapped_fields") or {
         name: [f.name for f in TABLES[name].fields if f.name in df.columns and df[f.name].notna().any()]
-        for name, df in tables.items()
+        for name, df in tables.items() if name in TABLES
     }
     return LoadedData(tables=tables, mapped_fields=mapped), journal, meta

@@ -17,6 +17,8 @@ def build_profile(data: LoadedData, journal: pd.DataFrame, issues: list[Issue]) 
     volumes, missing, dates = [], [], []
     for name, df in data.tables.items():
         volumes.append({"table": name, "rows": len(df)})
+        if name not in TABLES:
+            continue
         mapped = set(data.mapped_fields[name])
         for f in TABLES[name].fields:
             if f.name not in df.columns:

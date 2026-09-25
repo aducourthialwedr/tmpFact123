@@ -289,6 +289,50 @@ def _enrich(tables: dict[str, pd.DataFrame], executor: Executor | None = None) -
         )
 
 
+PARTY_ROLES = ("assignor", "debtor")
+
+
+def consolidate_parties(tables: dict[str, pd.DataFrame], issues: list[Issue]) -> None:
+    """Une ligne par partie ; tous les couples (IBAN, bankroll) dans la table `party_iban`.
+
+    Les sources peuvent contenir plusieurs lignes pour une même partie (plusieurs comptes, plusieurs
+    portefeuilles, historique). On garde : le premier nom non vide (toutes les variantes dans
+    `name_variants`, pour l'index des noms), le premier bankroll_code non vide, la date d'ouverture la
+    plus ancienne, et une fermeture seulement si toutes les lignes sont fermées (la plus récente).
+    Le rapport de chargement indique quelles colonnes varient entre les lignes d'une même partie.
+    """
+    ibans = []
+    for role in PARTY_ROLES:
+        df = tables[role]
+        missing_id = df["party_id"].isna()
+        if missing_id.any():
+            issues.append(Issue(role, "party_id", "identifiant_manquant", int(missing_id.sum()), "lignes ignorées"))
+            df = df[~missing_id]
+        dup = df["party_id"].duplicated(keep=False)
+        if dup.any():
+            d = df[dup]
+            varying = []
+            for col in ("iban", "bankroll_code", "name_norm", "opened_at", "closed_at"):
+                n = int((d.groupby("party_id")[col].nunique(dropna=False) > 1).sum())
+                if n:
+                    varying.append(f"{col} ({n})")
+            issues.append(Issue(role, "party_id", "lignes_multiples_par_partie", int(d["party_id"].nunique()),
+                                f"{int(dup.sum())} lignes consolidées ; colonnes qui varient entre les lignes "
+                                f"d'une même partie : {', '.join(varying) or 'aucune'}"))
+        ibans.append(df.loc[df["iban"].notna(), ["party_id", "iban", "bankroll_code"]]
+                     .drop_duplicates().assign(role=role))
+        g = df.groupby("party_id", sort=False)
+        out = g.first()
+        out["opened_at"] = g["opened_at"].min()
+        still_open = g["closed_at"].count() < g.size()
+        out["closed_at"] = g["closed_at"].max().where(~still_open)
+        variants = df[["party_id", "name_norm"]].dropna().drop_duplicates()
+        out["name_variants"] = variants.groupby("party_id", sort=False)["name_norm"].agg(list).reindex(out.index)
+        out["name_variants"] = [v if isinstance(v, list) else [] for v in out["name_variants"]]
+        tables[role] = out.reset_index()[[*df.columns, "name_variants"]]
+    tables["party_iban"] = pd.concat(ibans, ignore_index=True)[["role", "party_id", "iban", "bankroll_code"]]
+
+
 def load_all(
     schema_cfg: dict[str, Any], base_dir: str | Path | None = None, workers: int = 1
 ) -> LoadedData:
@@ -327,4 +371,5 @@ def load_all(
             _enrich(tables, executor)
     else:
         _enrich(tables)
+    consolidate_parties(tables, issues)
     return LoadedData(tables=tables, mapped_fields=mapped, issues=issues, audit=audit)

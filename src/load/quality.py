@@ -33,7 +33,7 @@ def check_quality(data: LoadedData, imputation_derived: pd.DataFrame | None = No
 
     # Unicité des clés primaires.
     for name, df in t.items():
-        pk = list(TABLES[name].primary_key)
+        pk = list(TABLES[name].primary_key) if name in TABLES else []
         if pk:
             add(name, ",".join(pk), "cle_dupliquee", _count(df.duplicated(pk, keep=False)))
 

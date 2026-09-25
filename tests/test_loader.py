@@ -156,3 +156,44 @@ def test_invalid_values_are_reported(synthetic_dir, synthetic_schema, tmp_path):
     assert kinds[("amount", "valeur_invalide")] == 1
     assert kinds[("value_date", "valeur_invalide")] == 1
     assert pd.isna(data.tables["payment"].loc[0, "amount"])
+
+
+def test_parties_with_several_rows_are_consolidated(synthetic_dir, synthetic_schema, tmp_path):
+    for f in synthetic_dir.iterdir():
+        shutil.copy(f, tmp_path / f.name)
+    deb = pd.read_csv(tmp_path / "debtor.csv", dtype=str, keep_default_na=False)
+    first = deb.iloc[0].copy()
+    extra = first.copy()
+    extra["iban"] = "FR76 1234 5678 9012 3456 7890 123"
+    extra["bankroll_code"] = "BR_AUTRE"
+    extra["name"] = first["name"] + " HOLDING"
+    extra["opened_at"] = "2020-01-01"
+    pd.concat([deb, pd.DataFrame([extra])], ignore_index=True).to_csv(tmp_path / "debtor.csv", index=False)
+
+    data = load_all(synthetic_schema, tmp_path)
+    debtors = data.tables["debtor"]
+    assert debtors["party_id"].is_unique and len(debtors) == len(deb)
+    row = debtors.set_index("party_id").loc[first["party_id"]]
+    assert row["opened_at"] == pd.Timestamp("2020-01-01")
+    assert len(row["name_variants"]) == 2
+    links = data.tables["party_iban"]
+    own = links[(links["role"] == "debtor") & (links["party_id"] == first["party_id"])]
+    assert set(own["iban"]) == {first["iban"].replace(" ", ""), extra["iban"].replace(" ", "")}
+    issue = next(i for i in data.issues if i.kind == "lignes_multiples_par_partie")
+    assert issue.table == "debtor" and issue.count == 1 and "iban" in issue.detail and "bankroll_code" in issue.detail
+
+
+def test_closed_only_if_every_row_is_closed():
+    from src.load.loader import consolidate_parties
+    from tests.conftest import make_data
+    data = make_data(debtor=[{"party_id": "D1", "name": "A", "closed_at": "2024-03-01", "opened_at": "2024-01-01"},
+                             {"party_id": "D1", "name": "A", "opened_at": "2023-06-01"},
+                             {"party_id": "D2", "name": "B", "closed_at": "2024-02-01"},
+                             {"party_id": "D2", "name": "B", "closed_at": "2024-05-01"}],
+                     assignor=[{"party_id": "A1", "name": "C"}])
+    for role in ("debtor", "assignor"):
+        data.tables[role]["name_norm"] = data.tables[role]["name"]
+    consolidate_parties(data.tables, [])
+    d = data.tables["debtor"].set_index("party_id")
+    assert pd.isna(d.loc["D1", "closed_at"]) and d.loc["D1", "opened_at"] == pd.Timestamp("2023-06-01")
+    assert d.loc["D2", "closed_at"] == pd.Timestamp("2024-05-01")

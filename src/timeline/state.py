@@ -96,6 +96,7 @@ class LedgerState:
         self._cf = t["client_file"].reset_index(drop=True) if "client_file" in t else None
         self._cfl = t["client_file_line"].reset_index(drop=True) if "client_file_line" in t else None
         self._tech = t["technical_account"].reset_index(drop=True) if "technical_account" in t else None
+        self._party_iban = t["party_iban"].reset_index(drop=True) if "party_iban" in t else None
 
         self.inv_pos = _Positions(self._inv["invoice_id"])
         self.pay_pos = _Positions(self._pay["payment_id"])
@@ -430,7 +431,8 @@ class LedgerState:
     def table(self, name: str) -> pd.DataFrame:
         """Table statique (attributs non temporels). Toute lecture d'existence passe par les accesseurs datés."""
         return {"invoice": self._inv, "payment": self._pay, "agreement": self._agr, "client_file": self._cf,
-                "client_file_line": self._cfl, "technical_account": self._tech, **self._parties}[name]
+                "client_file_line": self._cfl, "technical_account": self._tech,
+                "party_iban": self._party_iban, **self._parties}[name]
 
     # --- Accès pour l'itérateur ---------------------------------------------------------------------
 

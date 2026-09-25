@@ -73,11 +73,9 @@ class Allocator:
         self.names = NameIndex(deb, pay, sig.name.min_token_length) if sig.name.enabled else None
         self.iban = None
         if sig.iban.enabled or sig.client_file.enabled:
-            self.iban = IbanIndex(deb, asg, state.table("technical_account"))
+            self.iban = IbanIndex(deb, asg, state.table("technical_account"), state.table("party_iban"))
             self._pay_iban = self.iban.vocab.lookup(pay["iban_debtor"].astype(object).to_numpy())
             self._pay_bankroll = pay["bankroll_code"].astype(object).to_numpy()
-            self._deb_bankroll = deb["bankroll_code"].astype(object).to_numpy()
-            self._asg_bankroll = asg["bankroll_code"].astype(object).to_numpy()
 
         self._cf = state.table("client_file")
         if sig.client_file.enabled and self._cf is not None and self.ref is not None:
@@ -165,8 +163,11 @@ class Allocator:
         to_assignor = np.zeros(len(rows), dtype=bool)
         if conflict.any():
             pay_br = self._pay_bankroll[pos[rows]]
-            a_match = pd.DataFrame({"o": a_owner, "br": self._asg_bankroll[a_pos]})
-            d_match = pd.DataFrame({"o": d_owner, "br": self._deb_bankroll[d_pos]})
+            ib_rows = ib[rows]
+            a_match = pd.DataFrame({"o": a_owner, "ib": ib_rows[a_owner], "pos": a_pos}).merge(
+                self.iban.bankroll["assignor"], on=["ib", "pos"])
+            d_match = pd.DataFrame({"o": d_owner, "ib": ib_rows[d_owner], "pos": d_pos}).merge(
+                self.iban.bankroll["debtor"], on=["ib", "pos"])
             a_hit = np.zeros(len(rows), dtype=bool)
             d_hit = np.zeros(len(rows), dtype=bool)
             for frame, hit in ((a_match, a_hit), (d_match, d_hit)):

@@ -126,7 +126,12 @@ class NameIndex:
     """Terme → débiteurs ; débiteur → termes ; paiement → termes de son libellé."""
 
     def __init__(self, debtors: pd.DataFrame, payments: pd.DataFrame, min_length: int):
-        owners, terms = terms_by_owner(debtors["name_norm"], min_length)
+        # Toutes les variantes de nom d'un débiteur (lignes multiples en source), sinon son nom.
+        variants = debtors["name_variants"] if "name_variants" in debtors.columns \
+            else debtors["name_norm"].map(lambda n: [n])
+        exploded = pd.Series([v if len(v) else [""] for v in variants]).explode()
+        owners, terms = terms_by_owner(exploded.reset_index(drop=True), min_length)
+        owners = exploded.index.to_numpy(dtype=np.int64)[owners]
         self.vocab = Vocabulary(terms)
         self.term_debtors = Postings.build(self.vocab.codes, owners, len(self.vocab))
         self.debtor_terms = Postings.build(owners, self.vocab.codes, len(debtors))
@@ -135,16 +140,30 @@ class NameIndex:
         self.payment_terms = Postings.build(owners, self.vocab.lookup(terms), len(payments))
 
 
-class IbanIndex:
-    """IBAN → débiteurs, cédants ; ensemble des comptes techniques."""
+def party_ibans(debtors: pd.DataFrame, assignors: pd.DataFrame, party_iban: pd.DataFrame | None) -> pd.DataFrame:
+    """Couples (rôle, partie, IBAN, bankroll) : table `party_iban` du chargement, sinon colonnes des parties."""
+    if party_iban is not None:
+        return party_iban
+    parts = [df.loc[df["iban"].notna(), ["party_id", "iban", "bankroll_code"]].assign(role=role)
+             for role, df in (("assignor", assignors), ("debtor", debtors))]
+    return pd.concat(parts, ignore_index=True)
 
-    def __init__(self, debtors: pd.DataFrame, assignors: pd.DataFrame, technical: pd.DataFrame | None):
-        ibans = pd.concat([debtors["iban"], assignors["iban"]], ignore_index=True).dropna()
+
+class IbanIndex:
+    """IBAN → débiteurs, cédants (tous leurs comptes) ; bankroll par (IBAN, partie) ; comptes techniques."""
+
+    def __init__(self, debtors: pd.DataFrame, assignors: pd.DataFrame, technical: pd.DataFrame | None,
+                 party_iban: pd.DataFrame | None = None):
+        links = party_ibans(debtors, assignors, party_iban)
         tech = technical["iban"].dropna() if technical is not None else pd.Series([], dtype=object)
-        self.vocab = Vocabulary(pd.concat([ibans, tech], ignore_index=True).astype(object).to_numpy())
-        d_ids = self.vocab.lookup(debtors["iban"].astype(object).to_numpy())
-        a_ids = self.vocab.lookup(assignors["iban"].astype(object).to_numpy())
-        self.debtors = Postings.build(d_ids, np.arange(len(debtors)), len(self.vocab))
-        self.assignors = Postings.build(a_ids, np.arange(len(assignors)), len(self.vocab))
+        self.vocab = Vocabulary(pd.concat([links["iban"], tech], ignore_index=True).astype(object).to_numpy())
+        self.bankroll: dict[str, pd.DataFrame] = {}
+        for role, parties, attr in (("debtor", debtors, "debtors"), ("assignor", assignors, "assignors")):
+            rows = links[links["role"] == role]
+            pos = pd.Index(parties["party_id"].astype(object)).get_indexer(rows["party_id"].astype(object))
+            ids = self.vocab.lookup(rows["iban"].astype(object).to_numpy())
+            setattr(self, attr, Postings.build(ids, pos.astype(np.int64), len(self.vocab)))
+            self.bankroll[role] = pd.DataFrame({"ib": ids, "pos": pos, "br": rows["bankroll_code"].to_numpy()}) \
+                .query("ib >= 0 and pos >= 0").drop_duplicates()
         self.technical = np.zeros(len(self.vocab), dtype=bool)
         self.technical[self.vocab.lookup(tech.astype(object).to_numpy())] = True

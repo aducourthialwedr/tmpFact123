@@ -1182,6 +1182,50 @@ def _enrich(tables: dict[str, pd.DataFrame], executor: Executor | None = None) -
         )
 
 
+PARTY_ROLES = ("assignor", "debtor")
+
+
+def consolidate_parties(tables: dict[str, pd.DataFrame], issues: list[Issue]) -> None:
+    """Une ligne par partie ; tous les couples (IBAN, bankroll) dans la table `party_iban`.
+
+    Les sources peuvent contenir plusieurs lignes pour une même partie (plusieurs comptes, plusieurs
+    portefeuilles, historique). On garde : le premier nom non vide (toutes les variantes dans
+    `name_variants`, pour l'index des noms), le premier bankroll_code non vide, la date d'ouverture la
+    plus ancienne, et une fermeture seulement si toutes les lignes sont fermées (la plus récente).
+    Le rapport de chargement indique quelles colonnes varient entre les lignes d'une même partie.
+    """
+    ibans = []
+    for role in PARTY_ROLES:
+        df = tables[role]
+        missing_id = df["party_id"].isna()
+        if missing_id.any():
+            issues.append(Issue(role, "party_id", "identifiant_manquant", int(missing_id.sum()), "lignes ignorées"))
+            df = df[~missing_id]
+        dup = df["party_id"].duplicated(keep=False)
+        if dup.any():
+            d = df[dup]
+            varying = []
+            for col in ("iban", "bankroll_code", "name_norm", "opened_at", "closed_at"):
+                n = int((d.groupby("party_id")[col].nunique(dropna=False) > 1).sum())
+                if n:
+                    varying.append(f"{col} ({n})")
+            issues.append(Issue(role, "party_id", "lignes_multiples_par_partie", int(d["party_id"].nunique()),
+                                f"{int(dup.sum())} lignes consolidées ; colonnes qui varient entre les lignes "
+                                f"d'une même partie : {', '.join(varying) or 'aucune'}"))
+        ibans.append(df.loc[df["iban"].notna(), ["party_id", "iban", "bankroll_code"]]
+                     .drop_duplicates().assign(role=role))
+        g = df.groupby("party_id", sort=False)
+        out = g.first()
+        out["opened_at"] = g["opened_at"].min()
+        still_open = g["closed_at"].count() < g.size()
+        out["closed_at"] = g["closed_at"].max().where(~still_open)
+        variants = df[["party_id", "name_norm"]].dropna().drop_duplicates()
+        out["name_variants"] = variants.groupby("party_id", sort=False)["name_norm"].agg(list).reindex(out.index)
+        out["name_variants"] = [v if isinstance(v, list) else [] for v in out["name_variants"]]
+        tables[role] = out.reset_index()[[*df.columns, "name_variants"]]
+    tables["party_iban"] = pd.concat(ibans, ignore_index=True)[["role", "party_id", "iban", "bankroll_code"]]
+
+
 def load_all(
     schema_cfg: dict[str, Any], base_dir: str | Path | None = None, workers: int = 1
 ) -> LoadedData:
@@ -1220,6 +1264,7 @@ def load_all(
             _enrich(tables, executor)
     else:
         _enrich(tables)
+    consolidate_parties(tables, issues)
     return LoadedData(tables=tables, mapped_fields=mapped, issues=issues, audit=audit)
 
 
@@ -1405,7 +1450,7 @@ def check_quality(data: LoadedData, imputation_derived: pd.DataFrame | None = No
 
     # Unicité des clés primaires.
     for name, df in t.items():
-        pk = list(TABLES[name].primary_key)
+        pk = list(TABLES[name].primary_key) if name in TABLES else []
         if pk:
             add(name, ",".join(pk), "cle_dupliquee", _count(df.duplicated(pk, keep=False)))
 
@@ -1499,6 +1544,8 @@ def build_profile(data: LoadedData, journal: pd.DataFrame, issues: list[Issue]) 
     volumes, missing, dates = [], [], []
     for name, df in data.tables.items():
         volumes.append({"table": name, "rows": len(df)})
+        if name not in TABLES:
+            continue
         mapped = set(data.mapped_fields[name])
         for f in TABLES[name].fields:
             if f.name not in df.columns:
@@ -1590,13 +1637,14 @@ def load_interim(directory: str | Path, verify: bool = True) -> tuple[LoadedData
     if not meta_path.exists():
         raise InterimError(f"aucune sortie de l'étape 1 dans {d} : lancer d'abord le chargement")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    tables = {name: pd.read_parquet(d / f"{name}.parquet") for name in TABLES if (d / f"{name}.parquet").exists()}
+    names = [*TABLES, "party_iban"]
+    tables = {name: pd.read_parquet(d / f"{name}.parquet") for name in names if (d / f"{name}.parquet").exists()}
     journal = pd.read_parquet(d / "journal.parquet")
     if verify and journal_hash(journal) != meta["journal_sha256"]:
         raise InterimError("le journal ne correspond pas à son empreinte : relancer l'étape 1")
     mapped = meta.get("mapped_fields") or {
         name: [f.name for f in TABLES[name].fields if f.name in df.columns and df[f.name].notna().any()]
-        for name, df in tables.items()
+        for name, df in tables.items() if name in TABLES
     }
     return LoadedData(tables=tables, mapped_fields=mapped), journal, meta
 
@@ -2325,6 +2373,7 @@ class LedgerState:
         self._cf = t["client_file"].reset_index(drop=True) if "client_file" in t else None
         self._cfl = t["client_file_line"].reset_index(drop=True) if "client_file_line" in t else None
         self._tech = t["technical_account"].reset_index(drop=True) if "technical_account" in t else None
+        self._party_iban = t["party_iban"].reset_index(drop=True) if "party_iban" in t else None
 
         self.inv_pos = _Positions(self._inv["invoice_id"])
         self.pay_pos = _Positions(self._pay["payment_id"])
@@ -2659,7 +2708,8 @@ class LedgerState:
     def table(self, name: str) -> pd.DataFrame:
         """Table statique (attributs non temporels). Toute lecture d'existence passe par les accesseurs datés."""
         return {"invoice": self._inv, "payment": self._pay, "agreement": self._agr, "client_file": self._cf,
-                "client_file_line": self._cfl, "technical_account": self._tech, **self._parties}[name]
+                "client_file_line": self._cfl, "technical_account": self._tech,
+                "party_iban": self._party_iban, **self._parties}[name]
 
     # --- Accès pour l'itérateur ---------------------------------------------------------------------
 
@@ -3094,7 +3144,12 @@ class NameIndex:
     """Terme → débiteurs ; débiteur → termes ; paiement → termes de son libellé."""
 
     def __init__(self, debtors: pd.DataFrame, payments: pd.DataFrame, min_length: int):
-        owners, terms = terms_by_owner(debtors["name_norm"], min_length)
+        # Toutes les variantes de nom d'un débiteur (lignes multiples en source), sinon son nom.
+        variants = debtors["name_variants"] if "name_variants" in debtors.columns \
+            else debtors["name_norm"].map(lambda n: [n])
+        exploded = pd.Series([v if len(v) else [""] for v in variants]).explode()
+        owners, terms = terms_by_owner(exploded.reset_index(drop=True), min_length)
+        owners = exploded.index.to_numpy(dtype=np.int64)[owners]
         self.vocab = Vocabulary(terms)
         self.term_debtors = Postings.build(self.vocab.codes, owners, len(self.vocab))
         self.debtor_terms = Postings.build(owners, self.vocab.codes, len(debtors))
@@ -3103,17 +3158,31 @@ class NameIndex:
         self.payment_terms = Postings.build(owners, self.vocab.lookup(terms), len(payments))
 
 
-class IbanIndex:
-    """IBAN → débiteurs, cédants ; ensemble des comptes techniques."""
+def party_ibans(debtors: pd.DataFrame, assignors: pd.DataFrame, party_iban: pd.DataFrame | None) -> pd.DataFrame:
+    """Couples (rôle, partie, IBAN, bankroll) : table `party_iban` du chargement, sinon colonnes des parties."""
+    if party_iban is not None:
+        return party_iban
+    parts = [df.loc[df["iban"].notna(), ["party_id", "iban", "bankroll_code"]].assign(role=role)
+             for role, df in (("assignor", assignors), ("debtor", debtors))]
+    return pd.concat(parts, ignore_index=True)
 
-    def __init__(self, debtors: pd.DataFrame, assignors: pd.DataFrame, technical: pd.DataFrame | None):
-        ibans = pd.concat([debtors["iban"], assignors["iban"]], ignore_index=True).dropna()
+
+class IbanIndex:
+    """IBAN → débiteurs, cédants (tous leurs comptes) ; bankroll par (IBAN, partie) ; comptes techniques."""
+
+    def __init__(self, debtors: pd.DataFrame, assignors: pd.DataFrame, technical: pd.DataFrame | None,
+                 party_iban: pd.DataFrame | None = None):
+        links = party_ibans(debtors, assignors, party_iban)
         tech = technical["iban"].dropna() if technical is not None else pd.Series([], dtype=object)
-        self.vocab = Vocabulary(pd.concat([ibans, tech], ignore_index=True).astype(object).to_numpy())
-        d_ids = self.vocab.lookup(debtors["iban"].astype(object).to_numpy())
-        a_ids = self.vocab.lookup(assignors["iban"].astype(object).to_numpy())
-        self.debtors = Postings.build(d_ids, np.arange(len(debtors)), len(self.vocab))
-        self.assignors = Postings.build(a_ids, np.arange(len(assignors)), len(self.vocab))
+        self.vocab = Vocabulary(pd.concat([links["iban"], tech], ignore_index=True).astype(object).to_numpy())
+        self.bankroll: dict[str, pd.DataFrame] = {}
+        for role, parties, attr in (("debtor", debtors, "debtors"), ("assignor", assignors, "assignors")):
+            rows = links[links["role"] == role]
+            pos = pd.Index(parties["party_id"].astype(object)).get_indexer(rows["party_id"].astype(object))
+            ids = self.vocab.lookup(rows["iban"].astype(object).to_numpy())
+            setattr(self, attr, Postings.build(ids, pos.astype(np.int64), len(self.vocab)))
+            self.bankroll[role] = pd.DataFrame({"ib": ids, "pos": pos, "br": rows["bankroll_code"].to_numpy()}) \
+                .query("ib >= 0 and pos >= 0").drop_duplicates()
         self.technical = np.zeros(len(self.vocab), dtype=bool)
         self.technical[self.vocab.lookup(tech.astype(object).to_numpy())] = True
 
@@ -3189,11 +3258,9 @@ class Allocator:
         self.names = NameIndex(deb, pay, sig.name.min_token_length) if sig.name.enabled else None
         self.iban = None
         if sig.iban.enabled or sig.client_file.enabled:
-            self.iban = IbanIndex(deb, asg, state.table("technical_account"))
+            self.iban = IbanIndex(deb, asg, state.table("technical_account"), state.table("party_iban"))
             self._pay_iban = self.iban.vocab.lookup(pay["iban_debtor"].astype(object).to_numpy())
             self._pay_bankroll = pay["bankroll_code"].astype(object).to_numpy()
-            self._deb_bankroll = deb["bankroll_code"].astype(object).to_numpy()
-            self._asg_bankroll = asg["bankroll_code"].astype(object).to_numpy()
 
         self._cf = state.table("client_file")
         if sig.client_file.enabled and self._cf is not None and self.ref is not None:
@@ -3281,8 +3348,11 @@ class Allocator:
         to_assignor = np.zeros(len(rows), dtype=bool)
         if conflict.any():
             pay_br = self._pay_bankroll[pos[rows]]
-            a_match = pd.DataFrame({"o": a_owner, "br": self._asg_bankroll[a_pos]})
-            d_match = pd.DataFrame({"o": d_owner, "br": self._deb_bankroll[d_pos]})
+            ib_rows = ib[rows]
+            a_match = pd.DataFrame({"o": a_owner, "ib": ib_rows[a_owner], "pos": a_pos}).merge(
+                self.iban.bankroll["assignor"], on=["ib", "pos"])
+            d_match = pd.DataFrame({"o": d_owner, "ib": ib_rows[d_owner], "pos": d_pos}).merge(
+                self.iban.bankroll["debtor"], on=["ib", "pos"])
             a_hit = np.zeros(len(rows), dtype=bool)
             d_hit = np.zeros(len(rows), dtype=bool)
             for frame, hit in ((a_match, a_hit), (d_match, d_hit)):
