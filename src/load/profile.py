@@ -62,7 +62,7 @@ def _md_table(df: pd.DataFrame) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_markdown(profile: dict[str, pd.DataFrame], meta: dict[str, Any]) -> str:
+def render_profile_markdown(profile: dict[str, pd.DataFrame], meta: dict[str, Any]) -> str:
     missing = profile["missing_fields"]
     notable = missing[(~missing["mapped"]) | (missing["null"] > 0)]
     parts = [
@@ -82,5 +82,5 @@ def write_reports(profile: dict[str, pd.DataFrame], meta: dict[str, Any], report
     for name, df in profile.items():
         df.to_csv(reports_dir / f"load_{name}.csv", index=False)
     md_path = reports_dir / "load_profile.md"
-    md_path.write_text(render_markdown(profile, meta), encoding="utf-8")
+    md_path.write_text(render_profile_markdown(profile, meta), encoding="utf-8")
     return md_path

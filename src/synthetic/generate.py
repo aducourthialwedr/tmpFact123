@@ -115,7 +115,7 @@ def _ids(prefix: str, n: int, width: int) -> np.ndarray:
     return (prefix + pd.Series(np.arange(n)).astype(str).str.zfill(width)).to_numpy()
 
 
-def _days(start: np.datetime64, offsets: np.ndarray) -> np.ndarray:
+def _day_offsets(start: np.datetime64, offsets: np.ndarray) -> np.ndarray:
     return start + offsets.astype("timedelta64[D]")
 
 
@@ -135,7 +135,7 @@ def generate(cfg: SyntheticConfig = SyntheticConfig()) -> dict[str, pd.DataFrame
         "bankroll_code": rng.choice(["BR_STD", "BR_SP"], n_a),
         "iban": _ibans(rng, n_a),
         "name": _companies(rng, n_a),
-        "opened_at": _days(start, -rng.integers(30, 900, n_a)),
+        "opened_at": _day_offsets(start, -rng.integers(30, 900, n_a)),
         "closed_at": np.full(n_a, np.datetime64("NaT"), dtype="datetime64[D]"),
     })
     a_weight = rng.pareto(1.5, n_a) + 1
@@ -145,7 +145,7 @@ def generate(cfg: SyntheticConfig = SyntheticConfig()) -> dict[str, pd.DataFrame
     n_d = max(5, round(cfg.n_payments * cfg.debtors_per_payment))
     d_iban = _ibans(rng, n_d)
     d_iban[rng.random(n_d) >= 0.9] = ""
-    d_opened = _days(start, -rng.integers(-120, 900, n_d))
+    d_opened = _day_offsets(start, -rng.integers(-120, 900, n_d))
     debtor = pd.DataFrame({
         "party_id": _ids("D", n_d, 6),
         "bankroll_code": rng.choice(["BR_STD", "BR_SP"], n_d),
@@ -170,7 +170,7 @@ def generate(cfg: SyntheticConfig = SyntheticConfig()) -> dict[str, pd.DataFrame
     n_ag = len(ag_debtor)
     ag_assignor = rng.choice(n_a, n_ag, p=a_weight / a_weight.sum())
     ag_created = np.maximum(d_opened[ag_debtor],
-                            _days(start, rng.integers(-400, 90, n_ag)))
+                            _day_offsets(start, rng.integers(-400, 90, n_ag)))
     ag_disabled = np.full(n_ag, np.datetime64("NaT"), dtype="datetime64[D]")
     dis = rng.random(n_ag) < 0.05
     room = np.maximum((end - ag_created).astype(int) - 120, 1)
@@ -364,7 +364,7 @@ def generate(cfg: SyntheticConfig = SyntheticConfig()) -> dict[str, pd.DataFrame
     # Paiements orphelins (3 %) : aucun lien avec une facture (remboursements, flux hors périmètre).
     # Ils ne sont jamais imputés ; tous les paiements liés à des factures le sont.
     n_o = round(n_p * cfg.orphan_share)
-    o_day = _days(start, rng.integers(0, cfg.n_days, n_o))
+    o_day = _day_offsets(start, rng.integers(0, cfg.n_days, n_o))
     o_iban = np.where(rng.random(n_o) < 0.5, technical["iban"].to_numpy()[rng.integers(0, len(technical), n_o)], "")
     o_unknown = o_iban == ""
     o_iban[o_unknown] = _ibans(rng, int(o_unknown.sum()))

@@ -22,7 +22,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from src.arrow_ops import to_arrow
-from src.load import normalize
+from src.load.normalize import enrich_label, enrich_name, enrich_reference, normalize_iban
 from src.load.canonical import TABLES, FieldType, Table
 
 DATETIME_DTYPE = "datetime64[us]"
@@ -251,40 +251,40 @@ def _enrich(tables: dict[str, pd.DataFrame], executor: Executor | None = None) -
     """Applique la normalisation (brief §3.3) aux libellés, références et noms."""
     pay = tables["payment"]
     for col in ("iban_debtor", "iban_creditor"):
-        pay[col] = normalize.normalize_iban(pay[col])
-    tables["payment"] = pd.concat([pay, normalize.enrich_label(pay["label"], executor=executor)], axis=1)
+        pay[col] = normalize_iban(pay[col])
+    tables["payment"] = pd.concat([pay, enrich_label(pay["label"], executor=executor)], axis=1)
 
     inv = tables["invoice"]
     tables["invoice"] = pd.concat(
         [
             inv,
-            normalize.enrich_reference(inv["client_reference"], "client_reference", executor),
-            normalize.enrich_reference(inv["internal_reference"], "internal_reference", executor),
+            enrich_reference(inv["client_reference"], "client_reference", executor),
+            enrich_reference(inv["internal_reference"], "internal_reference", executor),
         ],
         axis=1,
     )
 
     for name in ("assignor", "debtor"):
         party = tables[name]
-        party["iban"] = normalize.normalize_iban(party["iban"])
-        tables[name] = pd.concat([party, normalize.enrich_name(party["name"])], axis=1)
+        party["iban"] = normalize_iban(party["iban"])
+        tables[name] = pd.concat([party, enrich_name(party["name"])], axis=1)
 
     if "technical_account" in tables:
-        tables["technical_account"]["iban"] = normalize.normalize_iban(
+        tables["technical_account"]["iban"] = normalize_iban(
             tables["technical_account"]["iban"]
         )
 
     if "client_file" in tables:
         cf = tables["client_file"]
-        cf["iban"] = normalize.normalize_iban(cf["iban"])
+        cf["iban"] = normalize_iban(cf["iban"])
         tables["client_file"] = pd.concat(
-            [cf, normalize.enrich_label(cf["payment_reference"], "payment_reference", executor)], axis=1
+            [cf, enrich_label(cf["payment_reference"], "payment_reference", executor)], axis=1
         )
 
     if "client_file_line" in tables:
         lines = tables["client_file_line"]
         tables["client_file_line"] = pd.concat(
-            [lines, normalize.enrich_reference(lines["invoice_reference"], "invoice_reference", executor)],
+            [lines, enrich_reference(lines["invoice_reference"], "invoice_reference", executor)],
             axis=1,
         )
 

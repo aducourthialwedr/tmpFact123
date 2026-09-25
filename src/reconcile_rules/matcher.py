@@ -35,7 +35,7 @@ R1, R2, R3, R4, R5 = "R1_CLIENT_FILE", "R2_REFERENCE_UNIQUE", "R3_AMOUNT_UNIQUE"
 _PROPOSAL_COLUMNS = ["row", "inv", "amount"]
 
 
-def _empty() -> pd.DataFrame:
+def _no_proposal() -> pd.DataFrame:
     return pd.DataFrame({c: pd.Series(dtype="int64") for c in _PROPOSAL_COLUMNS})
 
 
@@ -121,11 +121,11 @@ class RulesMatcher:
         files = alloc.payments["client_file_id"].to_numpy(dtype=object)
         rows = np.flatnonzero(pd.notna(files))
         if len(rows) == 0:
-            return _empty()
+            return _no_proposal()
         row_of_file = pd.Series(rows, index=files[rows])
         lines = self.state.client_file_lines(files[rows], as_of).reset_index(drop=True)
         if lines.empty:
-            return _empty()
+            return _no_proposal()
         lengths, flat = _flatten(lines["invoice_reference_keys"])
         line_of_key = np.repeat(np.arange(len(lines)), lengths)
         keys = self.ref.vocab.lookup(flat)
@@ -155,7 +155,7 @@ class RulesMatcher:
                     or abs(int(group["amount"].sum()) - int(amount[row])) > tol_abs):
                 continue
             out.append(group[["row", "inv", "amount"]])
-        return pd.concat(out, ignore_index=True) if out else _empty()
+        return pd.concat(out, ignore_index=True) if out else _no_proposal()
 
     def _r2(self, referenced: pd.DataFrame, amount: np.ndarray, params) -> pd.DataFrame:
         u = _unique_per_row(referenced)
@@ -182,7 +182,7 @@ class RulesMatcher:
     def _r4(self, rows: np.ndarray, amount: np.ndarray, as_of, scope: pd.DataFrame, params) -> pd.DataFrame:
         scope = scope[scope["row"].isin(rows)]
         if scope.empty:
-            return _empty()
+            return _no_proposal()
         debtors = np.unique(scope["debtor"].to_numpy())
         owner, inv, balance = self.state.debtor_open_invoices_at(debtors, as_of)
         eff = self._effective(inv, balance)
@@ -206,7 +206,7 @@ class RulesMatcher:
             if res.status == UNIQUE:
                 idx = list(res.indices)
                 out.append(pd.DataFrame({"row": row, "inv": invs[idx], "amount": bals[idx]}))
-        return pd.concat(out, ignore_index=True) if out else _empty()
+        return pd.concat(out, ignore_index=True) if out else _no_proposal()
 
     # --- Journée ------------------------------------------------------------------------------------------
 
