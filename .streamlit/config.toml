@@ -1,0 +1,11 @@
+# Aucun appel réseau sortant (brief §10) : pas de télémétrie, écoute locale uniquement.
+[browser]
+gatherUsageStats = false
+
+[server]
+address = "localhost"
+headless = true
+runOnSave = false
+
+[client]
+toolbarMode = "minimal"

@@ -1,0 +1,15 @@
+# Pipeline
+pandas>=2.2
+pyarrow>=15
+numpy>=1.26
+PyYAML>=6
+pydantic>=2.6
+scipy>=1.11
+scikit-learn>=1.4
+lightgbm>=4.3
+# Notebook
+jupyterlab>=4
+ipykernel>=6
+altair>=5
+# Interface (optionnelle)
+streamlit>=1.45

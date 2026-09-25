@@ -1,0 +1,139 @@
+# Mapping modèle canonique → noms réels des tables et colonnes.
+# À REMPLIR PAR L'ÉQUIPE. Aucune valeur ne doit être devinée.
+# Éditable à la main ou depuis l'UI (page Configuration).
+#
+# - Chaque `null` sous `columns` est une colonne réelle à renseigner.
+#   Les champs marqués (requis) bloquent le chargement tant qu'ils sont vides.
+#   Les autres peuvent rester à null : ils seront signalés dans le rapport.
+# - `source` : fichier (csv ou parquet) relatif à `base_dir`.
+# - `read_options` : options passées telles quelles à pandas.read_csv / read_parquet
+#   (ex. sep: ";", encoding: "latin-1").
+# - `value_maps` : traduction des valeurs réelles vers les valeurs canoniques,
+#   ex. status: {FULL: [TOTAL, SOLDE], PARTIAL: PARTIEL}.
+
+# Unité des montants dans les sources : "cents" (entiers de centimes) ou "units" (ex. 1234.56).
+amount_unit: null
+# Séparateur décimal des montants lus en texte ("." ou ",").
+decimal_separator: null
+# Fuseau des horodatages sans fuseau explicite (ex. "Europe/Paris"). null → UTC.
+source_timezone: null
+# Format strptime des dates (null → inférence pandas).
+date_format: null
+# Format strptime des horodatages (null → inférence pandas).
+timestamp_format: null
+# Répertoire des fichiers sources (relatif à la racine du dépôt ou absolu).
+base_dir: null
+
+tables:
+  payment:
+    source: null
+    read_options: {}
+    columns:
+      payment_id: null  # (requis)
+      value_date: null  # (requis)
+      booking_date: null  # date de comptabilisation si elle existe (§3.5) — ordonne le journal
+      amount: null  # (requis) signé
+      currency: null  # (requis)
+      iban_debtor: null
+      iban_creditor: null
+      label: null  # (requis)
+      channel: null
+      payment_type: null
+      bankroll_code: null  # souvent absent (§3.5)
+
+  invoice:
+    source: null
+    read_options: {}
+    columns:
+      invoice_id: null  # (requis)
+      client_reference: null  # (requis)
+      internal_reference: null
+      creation_date: null  # (requis)
+      due_date: null  # (requis)
+      initial_amount: null  # (requis)
+      current_amount: null  # audit uniquement, jamais utilisé par la pipeline
+      currency: null  # (requis)
+      debtor_id: null  # (requis)
+      agreement_id: null  # (requis)
+
+  imputation:
+    source: null
+    read_options: {}
+    columns:
+      payment_id: null  # (requis)
+      invoice_id: null  # (requis)
+      status: null  # (requis) FULL / PARTIAL après value_maps
+      updated_at: null  # (requis)
+      residual_amount: null  # (requis) solde de la facture APRÈS la ligne
+    value_maps:
+      status: {}
+
+  assignor:
+    source: null
+    read_options: {}
+    columns:
+      party_id: null  # (requis)
+      bankroll_code: null
+      iban: null
+      name: null  # (requis)
+      opened_at: null
+      closed_at: null
+
+  debtor:
+    source: null
+    read_options: {}
+    columns:
+      party_id: null  # (requis)
+      bankroll_code: null
+      iban: null
+      name: null  # (requis)
+      opened_at: null
+      closed_at: null  # peut ne pas exister (§3.5)
+
+  agreement:
+    source: null
+    read_options: {}
+    columns:
+      agreement_id: null  # (requis)
+      debtor_id: null  # (requis)
+      client_id: null  # (requis) → assignor.party_id
+      contract_number: null
+      created_at: null  # (requis)
+      disabled_at: null
+      market: null
+      product: null
+      recourse: null
+
+  # Optionnel — référentiel des IBAN de comptes techniques.
+  technical_account:
+    source: null
+    read_options: {}
+    columns:
+      iban: null  # (requis)
+      bankroll_code: null
+      description: null
+
+  # Optionnel — client files. FORMAT RÉEL À CONFIRMER (brief §3.2). Voie tabulaire uniquement.
+  client_file:
+    source: null
+    read_options: {}
+    columns:
+      file_id: null  # (requis)
+      received_at: null  # (requis) pivot temporel
+      source_format: null
+      payment_reference: null
+      total_amount: null
+      payment_date: null
+      iban: null
+      issuer_name: null
+
+  # Optionnel — lignes des client files.
+  client_file_line:
+    source: null
+    read_options: {}
+    columns:
+      file_id: null  # (requis)
+      line_no: null
+      invoice_reference: null  # (requis)
+      amount: null
+      gap_reason: null

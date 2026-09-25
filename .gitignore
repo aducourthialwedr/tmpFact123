@@ -1,0 +1,12 @@
+# Données, sorties et artefacts générés (volumineux, régénérables)
+data/
+reports/
+models/
+dist/
+
+# Environnements et caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/

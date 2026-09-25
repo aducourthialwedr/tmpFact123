@@ -1,0 +1,216 @@
+# Paramètres de la pipeline, par étape. Édité à la main, depuis le notebook ou par l'UI (streamlit run src/ui/app.py).
+# Les règles de l'étape 4 sont dans config/rules.yaml.
+
+# Chemins.
+paths:
+  # Tables normalisées et journal produits par l'étape 1.
+  interim_dir: data/interim
+  # Rapports CSV et markdown.
+  reports_dir: reports
+  # Jeux synthétiques, un sous-dossier par volume et seed.
+  synthetic_dir: data/synthetic
+  # Modèles de l'étape 5 (un sous-dossier par jeu de données).
+  models_dir: models
+
+# Étape 1 — chargement.
+load:
+  # Processus pour la normalisation des gros volumes (1 = séquentiel). Sans effet sur le résultat.
+  workers: 12
+
+# Étape 2 — découpage temporel.
+split:
+  # Durée de la période de test (backtest), en mois : les derniers mois de l'historique.
+  test_months: 2
+  # Durée de la période de validation, en mois, juste avant le test.
+  validation_months: 2
+  # Durée de la période d'entraînement, en mois. null = tout l'historique disponible avant la
+  # validation.
+  train_months: null
+  # Jours exclus entre deux périodes (purge), pour éviter qu'un groupe d'imputations chevauche
+  # deux blocs.
+  purge_days: 5
+  # Dernier jour de la période de test. null = dernier jour de paiement présent dans les données.
+  anchor_end: null
+  # Durée pendant laquelle un paiement non résolu reste dans le reliquat retraité chaque jour.
+  retention_days: 60
+
+# Étape 3 — allocation.
+allocation:
+  # Signaux d'allocation, du plus fort au plus faible.
+  signals:
+    # Signal 1 (le plus fort).
+    client_file:
+      # Rattacher le paiement au client file correspondant (référence de virement, montant total,
+      # date, IBAN).
+      enabled: true
+      # Écart maximal entre la date du client file et la date de valeur du paiement pour
+      # corroborer le rattachement.
+      date_tolerance_days: 5
+    # Signal 2.
+    reference:
+      # Débiteur de la facture dont la référence figure dans le libellé.
+      enabled: true
+      # Longueur minimale d'une clé de référence utilisée (les clés courtes sont du bruit :
+      # années, numéros de rue).
+      min_key_length: 4
+      # Longueur minimale d'une clé désignant un seul débiteur pour constituer un signal fort
+      # (allocation ferme).
+      strong_min_key_length: 6
+      # Une clé partagée par plus de débiteurs (factures existantes à D) est ignorée.
+      max_debtors_per_key: 5
+    # Signal 3.
+    iban:
+      # Routage IBAN (DEBTOR_DIRECT / ASSIGNOR / TECHNICAL_ACCOUNT / UNKNOWN) arbitré par
+      # bankroll_code.
+      enabled: true
+    # Signal 4.
+    name:
+      # Similarité entre le libellé et le nom du débiteur (index inversé).
+      enabled: true
+      # Score de nom minimal : part du nom retrouvée dans le libellé (pondérée par la rareté des
+      # mots, bigrammes inclus), ou spécificité du meilleur mot (1 / nombre de débiteurs le
+      # portant). À calibrer.
+      min_similarity: 0.5
+      # Élagage : un mot présent dans plus que cette part des noms de débiteurs est ignoré. À
+      # calibrer.
+      max_token_share: 0.01
+      # Élagage absolu : un mot partagé par plus de débiteurs est ignoré, quelle que soit leur
+      # part.
+      max_debtors_per_term: 200
+      # Longueur minimale d'un mot indexé.
+      min_token_length: 3
+    # Signal 5 (le plus faible).
+    amount:
+      # Débiteurs ayant une facture ouverte à D dont le restant dû égale exactement le montant du
+      # paiement. Extension du brief (clé K3 de la spec).
+      enabled: true
+      # Un montant partagé par plus de débiteurs (factures ouvertes à D) est ignoré, sauf
+      # confirmation par le nom.
+      max_debtors_per_amount: 3
+      # Jusqu'à ce nombre de débiteurs partageant le montant, ceux dont un mot du nom (même
+      # fréquent) figure dans le libellé sont retenus.
+      max_debtors_with_name_hint: 30
+  # Taille maximale de la liste classée de débiteurs candidats transmise aux étapes suivantes.
+  max_candidates: 10
+  # Rappel d'allocation visé : le vrai débiteur doit figurer dans la liste. Bloquant pour passer à
+  # l'étape 4.
+  target_recall: 0.99
+
+# Étape 5 — réconciliation ML.
+reconcile_ml:
+  # Génération de candidats.
+  candidates:
+    # Factures ouvertes des débiteurs candidats de l'allocation.
+    allocated_debtors: true
+    # Factures dont la référence figure dans le libellé, sans fenêtre temporelle.
+    reference_no_window: true
+    # Factures dont le montant ouvert égale le paiement.
+    amount_exact: true
+    # Fenêtre ± jours de la clé montant.
+    amount_window_days: 90
+    # Factures citées dans le client file rattaché.
+    client_file_cited: true
+    # Clé débiteur : échéances jusqu'à ce nombre de jours avant la date de valeur.
+    debtor_window_before_days: 180
+    # Clé débiteur : échéances jusqu'à ce nombre de jours après la date de valeur.
+    debtor_window_after_days: 30
+    # Clé débiteur : factures des N premiers débiteurs de l'allocation seulement (les gros
+    # débiteurs ont des milliers de factures ouvertes).
+    max_debtors: 3
+    # Candidats maximum par paiement : clés référence, montant et client file d'abord, puis
+    # factures du débiteur les plus proches en montant ou en échéance.
+    max_per_payment: 50
+  # Familles de features actives.
+  features:
+    # Montant : écarts, escompte, frais bancaires, retenue de garantie.
+    amount: true
+    # Temporel : délai à l'échéance, ancienneté de la facture.
+    temporal: true
+    # Textuel : référence exacte / partielle, similarité de nom.
+    textual: true
+    # Identité : route IBAN, bankroll, canal, contrat.
+    identity: true
+    # Comportemental : agrégats du débiteur, fenêtre strictement antérieure.
+    behavioral: true
+    # Fenêtre glissante des agrégats comportementaux.
+    behavioral_window_days: 180
+    # Contexte contrat : market, product, recourse.
+    contract: true
+    # Score et signal d'allocation du débiteur.
+    allocation: true
+    # Présence et concordance du client file.
+    client_file: true
+  # Deuxième passe avec features de compétition (rang, marge au second, nombre de candidats).
+  second_pass: true
+  # Calibration isotonique des scores sur la validation.
+  calibration: true
+  # Entraînement.
+  training:
+    # Part des paiements du résiduel conservés pour l'entraînement (tous leurs candidats sont
+    # gardés : pas d'échantillonnage des négatifs).
+    payment_sample: 0.5
+    # Nombre maximal d'arbres (arrêt précoce sur la validation).
+    num_boost_round: 400
+    # Taux d'apprentissage LightGBM.
+    learning_rate: 0.05
+    # Feuilles par arbre.
+    num_leaves: 63
+    # Observations minimales par feuille.
+    min_data_in_leaf: 50
+    # Graine (reproductibilité).
+    seed: 42
+  # Résolution des ensembles.
+  sets:
+    # Reconstitution des ensembles (1↔n, n↔n) par DFS borné.
+    enabled: true
+    # Passe 1 : sous-ensemble dont la somme est proche du paiement.
+    near_sum: true
+    # Passe 2 : agrégation des paiements d'un même débiteur.
+    n_to_n: true
+    # Fenêtre d'agrégation des paiements n↔n.
+    n_to_n_window_hours: 72
+    # Passe 3 : candidat unique.
+    single_candidate: true
+    # Cardinalité maximale d'un ensemble.
+    max_invoices: 5
+    # Candidats les mieux scorés en entrée du DFS.
+    max_candidates: 25
+    # Tolérance absolue sur la somme (centimes).
+    tolerance_abs_cents: 500
+    # Tolérance relative sur la somme.
+    tolerance_rel: 0.03
+    # Budget de nœuds explorés ; au-delà → revue.
+    node_budget: 100000
+  # Décision et seuils.
+  decision:
+    # τ_low : sous ce score, pas de proposition (le paiement reste en attente) ; entre τ_low et
+    # τ_high, revue.
+    review_min_score: 0.3
+    # δ : marge minimale au second candidat pour l'auto-validation. À calibrer.
+    min_margin: 0.05
+    # Seuils par segment si le volume le permet.
+    segmented_thresholds: false
+    # Dimensions de segmentation des seuils.
+    segments: [market, bankroll_code, amount_bucket, has_client_file]
+    # Volume de validation minimal pour qu'un segment ait son propre seuil.
+    min_segment_volume: 1000
+  # LLM sur libellés.
+  llm_labels:
+    # Extraction LLM de références bruitées sur le résiduel (optionnel, gardé seulement si le gain
+    # est mesurable).
+    enabled: false
+    # URL de l'API LLM on-premise. Aucun autre appel réseau.
+    endpoint: null
+    # Cache des réponses LLM.
+    cache_dir: data/cache/llm
+
+# Étape 6 — évaluation.
+evaluation:
+  # Précision visée : fixe τ_high et définit le taux d'automatisation à précision fixée.
+  target_precision: 0.995
+  # Taux d'automatisation de l'algorithme actuel (chiffre de référence client).
+  current_automation_rate: null
+  # Volume total de paiements de référence.
+  reference_total_volume: null
+  # Volume traité en manuel de référence.
+  reference_manual_volume: null

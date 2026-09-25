@@ -1,0 +1,52 @@
+# Règles déterministes de l'étape 4 (réconciliation algorithmique) — déclaratives et versionnées.
+# Chaque décision garde l'identifiant de la règle et la version de ce fichier.
+
+# Version du jeu de règles, tracée dans chaque décision. À incrémenter à toute modification.
+version: 2
+
+# Précision individuelle minimale : une règle mesurée en dessous est désactivée.
+min_precision: 0.995
+
+# Règles, appliquées par priorité croissante. Validation seulement si la solution est unique.
+rules:
+  - id: R1_CLIENT_FILE
+    name: Client file concordant
+    description: 'Chaque ligne du client file se résout vers une seule facture ouverte, montants concordants dans la tolérance : groupe entier validé.'
+    enabled: true
+    priority: 1
+    params:
+      tolerance_abs_cents: 0
+      tolerance_rel: 0.0
+      firm_only: 0
+  - id: R2_REFERENCE_UNIQUE
+    name: Référence exacte unique
+    description: Une seule facture ouverte correspond à une référence du libellé, montant égal au restant dû (dans la tolérance).
+    enabled: true
+    priority: 2
+    params:
+      tolerance_abs_cents: 0
+      firm_only: 0
+  - id: R3_AMOUNT_UNIQUE
+    name: Montant exact unique
+    description: Une seule facture ouverte du débiteur a exactement le montant du paiement.
+    enabled: true
+    priority: 3
+    params:
+      firm_only: 1
+  - id: R4_EXACT_SUM
+    name: Somme exacte
+    description: Un sous-ensemble unique de factures ouvertes du débiteur somme exactement au paiement (DFS borné).
+    enabled: true
+    priority: 4
+    params:
+      max_invoices: 5
+      node_budget: 100000
+      max_open_invoices: 30
+      firm_only: 1
+  - id: R5_PARTIAL_REFERENCED
+    name: Paiement partiel sur facture référencée
+    description: 'Référence unique, montant inférieur au restant dû : imputation PARTIAL.'
+    enabled: true
+    priority: 5
+    params:
+      firm_only: 0

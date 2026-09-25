@@ -1,0 +1,106 @@
+# Mapping du jeu synthétique (src/synthetic/generate.py). Ne concerne pas les données réelles.
+amount_unit: units
+decimal_separator: "."
+source_timezone: Europe/Paris
+date_format: "%Y-%m-%d"
+timestamp_format: "%Y-%m-%d %H:%M:%S"
+
+tables:
+  payment:
+    source: payment.csv
+    columns:
+      payment_id: payment_id
+      value_date: value_date
+      booking_date: booking_date
+      amount: amount
+      currency: currency
+      iban_debtor: iban_debtor
+      iban_creditor: iban_creditor
+      label: label
+      channel: channel
+      payment_type: payment_type
+
+  invoice:
+    source: invoice.csv
+    columns:
+      invoice_id: invoice_id
+      client_reference: client_reference
+      internal_reference: internal_reference
+      creation_date: creation_date
+      due_date: due_date
+      initial_amount: initial_amount
+      current_amount: current_amount
+      currency: currency
+      debtor_id: debtor_id
+      agreement_id: agreement_id
+
+  imputation:
+    source: imputation.csv
+    columns:
+      payment_id: payment_id
+      invoice_id: invoice_id
+      status: status
+      updated_at: updated_at
+      residual_amount: residual_amount
+    value_maps:
+      status: {FULL: TOTAL, PARTIAL: PARTIEL}
+
+  assignor:
+    source: assignor.csv
+    columns:
+      party_id: party_id
+      bankroll_code: bankroll_code
+      iban: iban
+      name: name
+      opened_at: opened_at
+      closed_at: closed_at
+
+  debtor:
+    source: debtor.csv
+    columns:
+      party_id: party_id
+      bankroll_code: bankroll_code
+      iban: iban
+      name: name
+      opened_at: opened_at
+
+  agreement:
+    source: agreement.csv
+    columns:
+      agreement_id: agreement_id
+      debtor_id: debtor_id
+      client_id: client_id
+      contract_number: contract_number
+      created_at: created_at
+      disabled_at: disabled_at
+      market: market
+      product: product
+      recourse: recourse
+
+  technical_account:
+    source: technical_account.csv
+    columns:
+      iban: iban
+      bankroll_code: bankroll_code
+      description: description
+
+  client_file:
+    source: client_file.csv
+    columns:
+      file_id: file_id
+      received_at: received_at
+      source_format: source_format
+      payment_reference: payment_reference
+      total_amount: total_amount
+      payment_date: payment_date
+      iban: iban
+      issuer_name: issuer_name
+
+  client_file_line:
+    source: client_file_line.csv
+    columns:
+      file_id: file_id
+      line_no: line_no
+      invoice_reference: invoice_reference
+      amount: amount
+      gap_reason: gap_reason
