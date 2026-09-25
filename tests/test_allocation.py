@@ -3,6 +3,7 @@
 import hashlib
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -236,3 +237,40 @@ def test_second_iban_of_a_debtor_routes_to_it():
     consolidate_parties(tables, [])
     a = allocate(data).payments.set_index("payment_id")
     assert a.loc["P9", "iban_route"] == DEBTOR_DIRECT and a.loc["P9", "firm_debtor_id"] == "D1"
+
+
+# --- Mémoire : vocabulaire compact, lots par blocs, clés et montants fréquents ----------------------
+
+def test_vocabulary_lookup():
+    from src.allocation.indexes import Vocabulary
+    v = Vocabulary(np.array(["FA1", None, "FA22", "FA1"], dtype=object))
+    assert len(v) == 2 and v.codes[1] == -1 and v.codes[0] == v.codes[3] != v.codes[2]
+    ids = v.lookup(np.array(["FA22", "XX", None, "FA1"], dtype=object))
+    assert ids.tolist() == [v.codes[2], -1, -1, v.codes[0]]
+    assert v.lengths[ids[[0, 3]]].tolist() == [4, 3]
+
+
+def test_chunked_allocation_matches_single_pass(monkeypatch):
+    import src.allocation.allocator as allocator
+    import src.allocation.indexes as indexes
+    whole = allocate(dataset())
+    monkeypatch.setattr(allocator, "CHUNK_ROWS", 3)
+    monkeypatch.setattr(indexes, "_PAYMENT_CHUNK", 2)
+    chunked = allocate(dataset())
+    pd.testing.assert_frame_equal(whole.payments, chunked.payments)
+    pd.testing.assert_frame_equal(whole.candidates.reset_index(drop=True), chunked.candidates.reset_index(drop=True))
+
+
+def test_frequent_key_kept_only_through_exact_amount():
+    """Clé portée par des factures de six débiteurs : ignorée, sauf la facture au montant exact du paiement."""
+    debtors = [{"party_id": f"D{i}", "name": f"Societe {i}", "opened_at": "2024-01-01"} for i in range(6)]
+    data = enriched(
+        assignor=[{"party_id": "A1", "name": "CEDANT", "opened_at": "2023-01-01"}], debtor=debtors,
+        agreement=[{"agreement_id": f"AGD{i}", "debtor_id": f"D{i}", "client_id": "A1", "created_at": "2024-01-01"}
+                   for i in range(6)],
+        invoice=[inv(f"I{i}", f"D{i}", "CMD123456", 1000 + i) for i in range(6)],
+        payment=[pay("P1", "CMD123456", 1003), pay("P2", "CMD123456", 999)], imputation=[])
+    a = allocate(data, settings(amount={"enabled": False}))
+    c = a.candidates
+    assert c.loc[c["payment_id"] == "P1", "debtor_id"].tolist() == ["D3"]
+    assert c[c["payment_id"] == "P2"].empty

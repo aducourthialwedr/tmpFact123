@@ -39,6 +39,13 @@ def _no_proposal() -> pd.DataFrame:
     return pd.DataFrame({c: pd.Series(dtype="int64") for c in _PROPOSAL_COLUMNS})
 
 
+def _first_two(frame: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    """Au plus deux lignes par groupe : les règles exigent une facture unique par paiement, deux factures
+    suffisent à établir l'ambiguïté. Évite de développer les milliers de factures d'une clé fréquente ou
+    d'un montant rond."""
+    return frame[frame.groupby(by, sort=False).cumcount().to_numpy() < 2]
+
+
 def _unique_per_row(pairs: pd.DataFrame) -> pd.DataFrame:
     """Lignes (row, inv, ...) des paiements pour lesquels une seule facture distincte ressort."""
     pairs = pairs.drop_duplicates(["row", "inv"])
@@ -112,10 +119,14 @@ class RulesMatcher:
         k_owner, inv = self.ref.key_invoices.gather(ukeys)
         balance = self._effective(inv, self.state.open_balance_at(inv, as_of))
         ok = balance > 0
-        invoices = pd.DataFrame({"k": k_owner[ok], "inv": inv[ok], "balance": balance[ok],
-                                 "debtor": self._inv_debtor[inv[ok]]})
-        pairs = pd.DataFrame({"row": row, "k": k_of_row}).drop_duplicates().merge(invoices, on="k")
-        return self._in_scope(pairs, scope)[["row", "inv", "balance"]].drop_duplicates(["row", "inv"])
+        invoices = _first_two(pd.DataFrame({"k": k_owner[ok], "debtor": self._inv_debtor[inv[ok]], "inv": inv[ok],
+                                            "balance": balance[ok]}), ["k", "debtor"])
+        # Portée d'abord (quelques débiteurs par paiement), puis factures par (clé, débiteur).
+        asked = pd.DataFrame({"row": row, "k": k_of_row}).drop_duplicates().merge(
+            scope[["row", "debtor"]].drop_duplicates(), on="row")
+        pairs = asked.merge(invoices, on=["k", "debtor"])
+        return (pairs[["row", "inv", "balance"]].drop_duplicates(["row", "inv"])
+                .sort_values("row", kind="stable").reset_index(drop=True))
 
     def _r1(self, pos, amount, alloc, as_of, scope, params) -> pd.DataFrame:
         files = alloc.payments["client_file_id"].to_numpy(dtype=object)
@@ -173,10 +184,13 @@ class RulesMatcher:
     def _r3(self, amount: np.ndarray, as_of, scope: pd.DataFrame) -> pd.DataFrame:
         inv, balance = self.state.open_invoice_positions(as_of)
         eff = self._effective(inv, balance)
-        open_ = pd.DataFrame({"amount": eff, "inv": inv, "debtor": self._inv_debtor[inv]})
-        rows = pd.DataFrame({"row": np.arange(len(amount)), "amount": amount})
-        pairs = rows[rows["amount"] > 0].merge(open_[open_["amount"] > 0], on="amount")
-        u = _unique_per_row(self._in_scope(pairs, scope))
+        open_ = pd.DataFrame({"amount": eff, "debtor": self._inv_debtor[inv], "inv": inv})
+        open_ = _first_two(open_[open_["amount"] > 0], ["amount", "debtor"])
+        # Portée d'abord, puis factures par (montant, débiteur) : pas de jointure sur le seul montant.
+        rows = scope[["row", "debtor"]].drop_duplicates()
+        rows = rows.assign(amount=amount[rows["row"].to_numpy()])
+        pairs = rows[rows["amount"] > 0].merge(open_, on=["amount", "debtor"])
+        u = _unique_per_row(pairs).sort_values("row", kind="stable")
         return u[["row", "inv", "amount"]].reset_index(drop=True)
 
     def _r4(self, rows: np.ndarray, amount: np.ndarray, as_of, scope: pd.DataFrame, params) -> pd.DataFrame:

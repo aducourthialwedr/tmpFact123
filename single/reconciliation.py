@@ -3085,22 +3085,64 @@ class Postings:
         return owner, self.values[starts + np.arange(total)]
 
 
+def _hash(values: np.ndarray) -> np.ndarray:
+    """Empreintes 64 bits déterministes de chaînes (valeurs nulles : 0, jamais dans un vocabulaire)."""
+    values = np.asarray(values, dtype=object)
+    if len(values) == 0:
+        return np.array([], dtype=np.uint64)
+    return pd.util.hash_array(values, categorize=False)
+
+
 class Vocabulary:
-    """Chaînes → identifiants entiers (−1 si inconnue)."""
+    """Chaînes → identifiants entiers (−1 si inconnue).
+
+    Stocke les empreintes 64 bits triées des chaînes, pas les chaînes : quelques octets par entrée
+    au lieu d'un objet Python et d'une table de hachage pandas. Une collision entre deux clés
+    distinctes (probabilité ~ n² / 2⁶⁵, soit 10⁻⁵ pour 30 millions de clés) les confondrait.
+    """
 
     def __init__(self, values: np.ndarray):
-        codes, uniques = pd.factorize(values)
-        self.codes = codes.astype(np.int64)
-        self.index = pd.Index(np.asarray(uniques, dtype=object), dtype=object)
-        self.lengths = np.fromiter((len(v) for v in self.index), dtype=np.int64, count=len(self.index))
+        values = np.asarray(values, dtype=object)
+        valid = ~pd.isna(values)
+        hashes = _hash(values[valid])
+        self.hashes, first, inverse = np.unique(hashes, return_index=True, return_inverse=True)
+        self.codes = np.full(len(values), -1, dtype=np.int64)
+        self.codes[valid] = inverse
+        kept = values[valid][first]
+        self.lengths = np.fromiter((len(v) for v in kept), dtype=np.int64, count=len(kept))
 
     def __len__(self) -> int:
-        return len(self.index)
+        return len(self.hashes)
 
     def lookup(self, values: np.ndarray) -> np.ndarray:
-        if len(values) == 0:
-            return np.array([], dtype=np.int64)
-        return self.index.get_indexer(values).astype(np.int64)
+        values = np.asarray(values, dtype=object)
+        out = np.full(len(values), -1, dtype=np.int64)
+        if len(values) == 0 or len(self.hashes) == 0:
+            return out
+        valid = ~pd.isna(values)
+        h = _hash(values[valid])
+        i = np.minimum(np.searchsorted(self.hashes, h), len(self.hashes) - 1)
+        out[valid] = np.where(self.hashes[i] == h, i, -1)
+        return out
+
+
+# Les listes de clés / termes des libellés sont traduites par blocs : pas de copie en objets Python
+# de tous les libellés de l'historique à la fois.
+_PAYMENT_CHUNK = 200_000
+
+
+def _payment_postings(n: int, ids_of_chunk) -> Postings:
+    """Paiement → identifiants, construits par blocs de `_PAYMENT_CHUNK` paiements.
+
+    `ids_of_chunk(start, end)` rend (propriétaire relatif au bloc, identifiant) ; −1 = hors vocabulaire.
+    """
+    owners, ids = [np.array([], dtype=np.int64)], [np.array([], dtype=np.int64)]
+    for start in range(0, n, _PAYMENT_CHUNK):
+        o, i = ids_of_chunk(start, min(start + _PAYMENT_CHUNK, n))
+        known = i >= 0
+        owners.append(o[known] + start)
+        ids.append(i[known])
+    return Postings.build(np.concatenate(owners), np.concatenate(ids), n)
 
 
 class ReferenceIndex:
@@ -3115,8 +3157,13 @@ class ReferenceIndex:
         flat = np.concatenate([p[1] for p in parts])
         self.vocab = Vocabulary(flat)
         self.key_invoices = Postings.build(self.vocab.codes, inv_pos, len(self.vocab))
-        lengths, flat = _flatten(payments["label_numbers"])
-        self.payment_keys = Postings.from_lists(lengths, self.vocab.lookup(flat))
+        numbers = payments["label_numbers"]
+
+        def keys_of(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+            lengths, flat = _flatten(numbers.iloc[start:end])
+            return np.repeat(np.arange(end - start), lengths), self.vocab.lookup(flat)
+
+        self.payment_keys = _payment_postings(len(payments), keys_of)
 
     def key_ids(self, keys) -> np.ndarray:
         return self.vocab.lookup(np.asarray(list(keys), dtype=object))
@@ -3154,8 +3201,13 @@ class NameIndex:
         self.term_debtors = Postings.build(self.vocab.codes, owners, len(self.vocab))
         self.debtor_terms = Postings.build(owners, self.vocab.codes, len(debtors))
         # Termes du libellé, restreints au vocabulaire des noms.
-        owners, terms = terms_by_owner(payments["label_norm"], min_length)
-        self.payment_terms = Postings.build(owners, self.vocab.lookup(terms), len(payments))
+        labels = payments["label_norm"]
+
+        def terms_of(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+            o, t = terms_by_owner(labels.iloc[start:end].reset_index(drop=True), min_length)
+            return o, self.vocab.lookup(t)
+
+        self.payment_terms = _payment_postings(len(payments), terms_of)
 
 
 def party_ibans(debtors: pd.DataFrame, assignors: pd.DataFrame, party_iban: pd.DataFrame | None) -> pd.DataFrame:
@@ -3224,6 +3276,9 @@ FIRM, MULTIPLE, NONE = "ferme", "multiple", "aucun"
 # Poids des signaux (score maximal qu'un signal seul peut donner). Valeurs initiales, à calibrer.
 WEIGHTS = {CLIENT_FILE: 1.0, REFERENCE: 0.95, IBAN: 0.9, NAME: 0.7, AMOUNT: 0.5}
 
+# Taille des blocs de paiements traités ensemble : borne la mémoire des jointures d'une journée.
+CHUNK_ROWS = 20_000
+
 _SIGNAL_COLUMNS = ["row", "debtor", "signal", "score", "strong"]
 _SIGNAL_CODE = {s: i for i, s in enumerate(SIGNALS)}
 _SIGNAL_BIT = {s: 1 << i for i, s in enumerate(SIGNALS)}
@@ -3271,8 +3326,8 @@ class Allocator:
             self._cf_iban = self.iban.vocab.lookup(cf["iban"].astype(object).to_numpy()) if self.iban else None
             self._cf_ref = cf["payment_reference_norm"].fillna("").astype(object).to_numpy()
             lines = state.table("client_file_line")
-            file_of_line = Vocabulary(cf["file_id"].astype(object).to_numpy()).lookup(
-                lines["file_id"].astype(object).to_numpy())
+            file_of_line = pd.Index(cf["file_id"].astype(object)).get_indexer(
+                lines["file_id"].astype(object)).astype(np.int64)
             lengths, flat = _flatten(lines["invoice_reference_keys"])
             owners = np.repeat(file_of_line, lengths)
             self._file_keys = Postings.build(owners, self.ref.vocab.lookup(flat), len(cf))
@@ -3280,6 +3335,7 @@ class Allocator:
             self._cf = None
         self._attached: dict[int, int] = {}       # paiement → client file (positions)
         self._consumed: set[int] = set()
+        self._amounts_as_of = None                 # (as_of, montants, débiteurs) du jour courant
 
     # --- Signaux -------------------------------------------------------------------------------
 
@@ -3308,15 +3364,27 @@ class Allocator:
         balance = self.state.open_balance_at(inv, as_of)
         deb = self._inv_debtor[inv]
         ok = (balance > 0) & (deb >= 0)
-        invoices = pd.DataFrame({"k": k_owner[ok], "debtor": deb[ok], "balance": balance[ok]})
-        pairs = pd.DataFrame({"row": row, "k": k_of_row}).drop_duplicates().merge(invoices, on="k")
+        k_owner, deb, balance = k_owner[ok], deb[ok], balance[ok]
+        asked = pd.DataFrame({"row": row, "k": k_of_row}).drop_duplicates()
+        # Jointures sur des tables dédoublonnées, jamais (ligne × toutes les factures de la clé) : une clé
+        # fréquente (numéro de commande générique, année) chez un gros débiteur porte des milliers de
+        # factures. Clé → débiteurs distincts ; clés partagées par trop de débiteurs écartées d'emblée.
+        key_debtors = pd.DataFrame({"k": k_owner, "debtor": deb}).drop_duplicates()
+        n_key = np.bincount(key_debtors["k"].to_numpy(), minlength=len(ukeys))
+        exact = pd.DataFrame({c: pd.Series(dtype="int64") for c in ("row", "k", "debtor")})
+        if row_amount is not None:
+            # Factures de la clé dont le restant dû égale le montant du paiement : elles seules comptent.
+            by_amount = pd.DataFrame({"k": k_owner, "amount": balance, "debtor": deb}).drop_duplicates()
+            exact = (asked.assign(amount=row_amount[asked["row"].to_numpy()])
+                     .merge(by_amount, on=["k", "amount"])[["row", "k", "debtor"]])
+            if len(exact):
+                code = asked["row"].to_numpy() * len(ukeys) + asked["k"].to_numpy()
+                matched = np.unique(exact["row"].to_numpy() * len(ukeys) + exact["k"].to_numpy())
+                asked = asked[~np.isin(code, matched)]
+        light = key_debtors[n_key[key_debtors["k"].to_numpy()] <= max_debtors]
+        pairs = pd.concat([exact, asked.merge(light, on="k")], ignore_index=True)
         if pairs.empty:
             return _empty_signal()
-        if row_amount is not None:
-            match = pairs["balance"].to_numpy() == row_amount[pairs["row"].to_numpy()]
-            any_match = pd.Series(match).groupby([pairs["row"].to_numpy(), pairs["k"].to_numpy()]).transform("any")
-            pairs = pairs[match | ~any_match.to_numpy()]
-        pairs = pairs.drop_duplicates(["row", "k", "debtor"])
         n_deb = pairs.groupby(["row", "k"])["debtor"].transform("size").to_numpy()
         pairs = pairs[n_deb <= max_debtors]
         n_deb = n_deb[n_deb <= max_debtors]
@@ -3425,14 +3493,22 @@ class Allocator:
         Tolérance d'escompte ou de frais : 5 € ou 3 %. Seuls les débiteurs retenus par le nom sont
         examinés (pas de recherche sur tous les débiteurs).
         """
-        debtors = np.unique(weak["debtor"].to_numpy())
+        debtors, d_of = np.unique(weak["debtor"].to_numpy(), return_inverse=True)
         owner, _, balance = self.state.debtor_open_invoices_at(debtors, as_of)
-        pairs = weak.merge(pd.DataFrame({"debtor": debtors[owner], "balance": balance}), on="debtor")
+        if len(owner) == 0:
+            return _empty_signal()
+        # Restants dus triés par (débiteur, montant) : pour chaque couple (paiement, débiteur), existe-t-il
+        # un restant dû dans [montant − tolérance, montant + tolérance] ? Deux recherches dichotomiques.
+        top = np.int64(1) << 40
+        sorted_keys = np.sort(owner.astype(np.int64) * top + np.clip(balance, 0, top - 1))
+        amount = self._pay_amount[pos[weak["row"].to_numpy()]]
+        tol = np.floor(np.maximum(500, 0.03 * amount)).astype(np.int64)   # |restant − montant| ≤ tol, en entiers
+        base = d_of.astype(np.int64) * top
+        lo = np.searchsorted(sorted_keys, base + np.clip(amount - tol, 0, top - 1), side="left")
+        hi = np.searchsorted(sorted_keys, base + np.clip(amount + tol, 0, top - 1), side="right")
+        pairs = weak[hi > lo]
         if pairs.empty:
             return _empty_signal()
-        amount = self._pay_amount[pos[pairs["row"].to_numpy()]]
-        tol = np.maximum(500, 0.03 * amount)
-        pairs = pairs[np.abs(pairs["balance"].to_numpy() - amount) <= tol].drop_duplicates(["row", "debtor"])
         n = pairs.groupby("row")["debtor"].transform("size").to_numpy()
         return pd.DataFrame({"row": pairs["row"].to_numpy(), "debtor": pairs["debtor"].to_numpy(), "signal": NAME,
                              "score": WEIGHTS[NAME] * 0.8 / n, "strong": False})
@@ -3444,18 +3520,23 @@ class Allocator:
         `max_debtors_with_name_hint`) : seuls ceux dont un mot du nom figure dans le libellé.
         """
         cfg = self.cfg.signals.amount
-        inv, balance = self.state.open_invoice_positions(as_of)
-        if len(inv) == 0:
+        amounts, debtors = self._open_amounts(as_of)
+        if len(amounts) == 0:
             return _empty_signal()
-        open_ = pd.DataFrame({"amount": balance, "debtor": self._inv_debtor[inv]})
-        open_ = open_[open_["debtor"] >= 0].drop_duplicates()
-        pays = pd.DataFrame({"row": np.arange(len(pos)), "amount": self._pay_amount[pos]})
-        pairs = pays[pays["amount"] > 0].merge(open_, on="amount")
-        if pairs.empty:
-            return _empty_signal()
-        n_all = pairs.groupby("row")["debtor"].transform("size").to_numpy()
+        # Couples (montant, débiteur) distincts triés par montant : les débiteurs d'un montant forment une
+        # tranche ; un montant rond partagé par trop de débiteurs est écarté sans être développé.
+        pay_amount = self._pay_amount[pos]
+        lo = np.searchsorted(amounts, pay_amount, side="left")
+        n_per_row = np.searchsorted(amounts, pay_amount, side="right") - lo
         limit = max(cfg.max_debtors_per_amount, cfg.max_debtors_with_name_hint if self.names is not None else 0)
-        pairs, n_all = pairs[n_all <= limit], n_all[n_all <= limit]
+        n_per_row[(pay_amount <= 0) | (n_per_row > limit)] = 0
+        total = int(n_per_row.sum())
+        if total == 0:
+            return _empty_signal()
+        rows = np.repeat(np.arange(len(pos)), n_per_row)
+        starts = np.repeat(lo - (np.cumsum(n_per_row) - n_per_row), n_per_row)
+        pairs = pd.DataFrame({"row": rows, "debtor": debtors[starts + np.arange(total)]})
+        n_all = n_per_row[rows]
         hint = self._name_hint(pos, pairs["row"].to_numpy(), pairs["debtor"].to_numpy())             if self.names is not None else np.zeros(len(pairs), dtype=bool)
         keep = (n_all <= cfg.max_debtors_per_amount) | hint
         pairs, hint, n_all = pairs[keep], hint[keep], n_all[keep]
@@ -3463,6 +3544,20 @@ class Allocator:
         n = np.where(hint & (n_all > cfg.max_debtors_per_amount), n_hint, n_all)
         return pd.DataFrame({"row": pairs["row"].to_numpy(), "debtor": pairs["debtor"].to_numpy(), "signal": AMOUNT,
                              "score": WEIGHTS[AMOUNT] / np.maximum(n, 1), "strong": False})
+
+    def _open_amounts(self, as_of) -> tuple[np.ndarray, np.ndarray]:
+        """Couples (restant dû, débiteur) distincts des factures ouvertes à D, triés ; calculés une fois par jour."""
+        if self._amounts_as_of is None or self._amounts_as_of[0] != as_of:
+            inv, balance = self.state.open_invoice_positions(as_of)
+            deb = self._inv_debtor[inv]
+            ok = deb >= 0
+            amount, deb = balance[ok].astype(np.int64), deb[ok].astype(np.int64)
+            order = np.lexsort((deb, amount))
+            amount, deb = amount[order], deb[order]
+            keep = np.ones(len(amount), dtype=bool)
+            keep[1:] = (amount[1:] != amount[:-1]) | (deb[1:] != deb[:-1])
+            self._amounts_as_of = (as_of, amount[keep], deb[keep])
+        return self._amounts_as_of[1], self._amounts_as_of[2]
 
     def _name_hint(self, pos: np.ndarray, rows: np.ndarray, debtors: np.ndarray) -> np.ndarray:
         """Pour chaque couple (ligne, débiteur) : un terme du nom du débiteur figure-t-il dans le libellé ?"""
@@ -3523,25 +3618,45 @@ class Allocator:
     # --- Allocation du lot -------------------------------------------------------------------------
 
     def allocate(self, ctx: DayContext) -> Allocation:
+        """Allocation du lot. Le rattachement des client files se fait sur tout le lot (unicité paiement ↔
+        fichier) ; les autres signaux, propres à chaque paiement, par blocs de `CHUNK_ROWS` lignes, ce qui
+        borne la mémoire quelle que soit la taille du reliquat."""
         as_of = ctx.as_of
         batch_ids = ctx.batch["payment_id"].astype(object).to_numpy()
         pos = self.state.pay_pos(pd.Series(batch_ids, dtype=object))
-        sig = self.cfg.signals
-        parts = []
-        route = np.full(len(pos), UNKNOWN, dtype=object)
         attached = np.full(len(pos), -1, dtype=np.int64)
-        if sig.client_file.enabled and self._cf is not None:
+        cf_signal = _empty_signal()
+        if self.cfg.signals.client_file.enabled and self._cf is not None:
             cf_signal, attached = self._client_file(pos, as_of)
-            parts.append(cf_signal)
-        if sig.reference.enabled:
-            parts.append(self._reference(pos, as_of))
-        if sig.iban.enabled:
-            iban_signal, route = self._iban(pos, as_of)
-            parts.append(iban_signal)
-        if sig.name.enabled:
-            parts.append(self._name(pos, as_of))
-        if sig.amount.enabled:
-            parts.append(self._amount(pos, as_of))
+        cf_row = cf_signal["row"].to_numpy()
+        chunks = []
+        for start in range(0, max(len(pos), 1), CHUNK_ROWS):
+            end = min(start + CHUNK_ROWS, len(pos))
+            in_chunk = (cf_row >= start) & (cf_row < end)
+            cf_part = cf_signal[in_chunk].assign(row=cf_row[in_chunk] - start)
+            chunks.append(self._allocate_rows(pos[start:end], batch_ids[start:end], attached[start:end],
+                                              cf_part, as_of))
+        if len(chunks) == 1:
+            return chunks[0]
+        # infer_objects : mêmes types qu'en un seul bloc (un bloc sans aucun débiteur ferme reste en `object`).
+        return Allocation(pd.concat([c.candidates for c in chunks], ignore_index=True).infer_objects(),
+                          pd.concat([c.payments for c in chunks], ignore_index=True).infer_objects())
+
+    def _allocate_rows(self, pos: np.ndarray, batch_ids: np.ndarray, attached: np.ndarray,
+                       cf_signal: pd.DataFrame, as_of) -> Allocation:
+        sig = self.cfg.signals
+        parts = [cf_signal]
+        route = np.full(len(pos), UNKNOWN, dtype=object)
+        if len(pos):
+            if sig.reference.enabled:
+                parts.append(self._reference(pos, as_of))
+            if sig.iban.enabled:
+                iban_signal, route = self._iban(pos, as_of)
+                parts.append(iban_signal)
+            if sig.name.enabled:
+                parts.append(self._name(pos, as_of))
+            if sig.amount.enabled:
+                parts.append(self._amount(pos, as_of))
         signals = pd.concat([p for p in parts if len(p)], ignore_index=True) if any(len(p) for p in parts) \
             else _empty_signal()
         return self._combine(signals, batch_ids, route, attached)
@@ -3572,8 +3687,9 @@ class Allocator:
             c_strong = np.logical_or.reduceat(strong, starts)
             c_bits = np.bitwise_or.reduceat(1 << code, starts)
             c_signal = code[starts]                          # signal au score le plus élevé
-            # Classement : score décroissant, puis position du débiteur (déterministe).
-            order = np.lexsort((c_deb, -c_score, c_row))
+            # Classement : score décroissant, puis position du débiteur (déterministe). Score arrondi pour le
+            # tri : deux scores égaux au bruit de sommation flottante près sont départagés par le débiteur.
+            order = np.lexsort((c_deb, -np.round(c_score, 9), c_row))
             c_row, c_deb, c_score, c_strong, c_bits, c_signal = (
                 a[order] for a in (c_row, c_deb, c_score, c_strong, c_bits, c_signal))
             first = np.flatnonzero(np.r_[True, c_row[1:] != c_row[:-1]])
@@ -3611,7 +3727,9 @@ Vérité : le débiteur des factures réellement imputées au paiement.
 
 
 
-_COMPACT_EVERY = 30
+# Le dernier passage de chaque paiement est dédoublonné tous les N jours : sans cela, les lots successifs
+# (reliquat compris) s'accumulent en mémoire.
+_COMPACT_EVERY = 5
 
 
 class AllocationProbe:
@@ -4187,6 +4305,13 @@ def _no_proposal() -> pd.DataFrame:
     return pd.DataFrame({c: pd.Series(dtype="int64") for c in _PROPOSAL_COLUMNS})
 
 
+def _first_two(frame: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    """Au plus deux lignes par groupe : les règles exigent une facture unique par paiement, deux factures
+    suffisent à établir l'ambiguïté. Évite de développer les milliers de factures d'une clé fréquente ou
+    d'un montant rond."""
+    return frame[frame.groupby(by, sort=False).cumcount().to_numpy() < 2]
+
+
 def _unique_per_row(pairs: pd.DataFrame) -> pd.DataFrame:
     """Lignes (row, inv, ...) des paiements pour lesquels une seule facture distincte ressort."""
     pairs = pairs.drop_duplicates(["row", "inv"])
@@ -4260,10 +4385,14 @@ class RulesMatcher:
         k_owner, inv = self.ref.key_invoices.gather(ukeys)
         balance = self._effective(inv, self.state.open_balance_at(inv, as_of))
         ok = balance > 0
-        invoices = pd.DataFrame({"k": k_owner[ok], "inv": inv[ok], "balance": balance[ok],
-                                 "debtor": self._inv_debtor[inv[ok]]})
-        pairs = pd.DataFrame({"row": row, "k": k_of_row}).drop_duplicates().merge(invoices, on="k")
-        return self._in_scope(pairs, scope)[["row", "inv", "balance"]].drop_duplicates(["row", "inv"])
+        invoices = _first_two(pd.DataFrame({"k": k_owner[ok], "debtor": self._inv_debtor[inv[ok]], "inv": inv[ok],
+                                            "balance": balance[ok]}), ["k", "debtor"])
+        # Portée d'abord (quelques débiteurs par paiement), puis factures par (clé, débiteur).
+        asked = pd.DataFrame({"row": row, "k": k_of_row}).drop_duplicates().merge(
+            scope[["row", "debtor"]].drop_duplicates(), on="row")
+        pairs = asked.merge(invoices, on=["k", "debtor"])
+        return (pairs[["row", "inv", "balance"]].drop_duplicates(["row", "inv"])
+                .sort_values("row", kind="stable").reset_index(drop=True))
 
     def _r1(self, pos, amount, alloc, as_of, scope, params) -> pd.DataFrame:
         files = alloc.payments["client_file_id"].to_numpy(dtype=object)
@@ -4321,10 +4450,13 @@ class RulesMatcher:
     def _r3(self, amount: np.ndarray, as_of, scope: pd.DataFrame) -> pd.DataFrame:
         inv, balance = self.state.open_invoice_positions(as_of)
         eff = self._effective(inv, balance)
-        open_ = pd.DataFrame({"amount": eff, "inv": inv, "debtor": self._inv_debtor[inv]})
-        rows = pd.DataFrame({"row": np.arange(len(amount)), "amount": amount})
-        pairs = rows[rows["amount"] > 0].merge(open_[open_["amount"] > 0], on="amount")
-        u = _unique_per_row(self._in_scope(pairs, scope))
+        open_ = pd.DataFrame({"amount": eff, "debtor": self._inv_debtor[inv], "inv": inv})
+        open_ = _first_two(open_[open_["amount"] > 0], ["amount", "debtor"])
+        # Portée d'abord, puis factures par (montant, débiteur) : pas de jointure sur le seul montant.
+        rows = scope[["row", "debtor"]].drop_duplicates()
+        rows = rows.assign(amount=amount[rows["row"].to_numpy()])
+        pairs = rows[rows["amount"] > 0].merge(open_, on=["amount", "debtor"])
+        u = _unique_per_row(pairs).sort_values("row", kind="stable")
         return u[["row", "inv", "amount"]].reset_index(drop=True)
 
     def _r4(self, rows: np.ndarray, amount: np.ndarray, as_of, scope: pd.DataFrame, params) -> pd.DataFrame:
@@ -4538,6 +4670,20 @@ def _group_starts(keys: np.ndarray) -> np.ndarray:
     return np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]]) if len(keys) else np.array([], dtype=np.int64)
 
 
+# Paires (paiement, facture) examinées au plus par bloc avant plafonnement : les gros débiteurs, les
+# références et montants fréquents produisent des milliers de paires par paiement.
+CANDIDATE_PAIR_BUDGET = 2_000_000
+
+
+def _row_blocks(load: np.ndarray, budget: int) -> list[tuple[int, int]]:
+    """Découpe consécutive de lignes dont la charge cumulée reste de l'ordre de `budget`."""
+    if len(load) == 0:
+        return [(0, 0)]
+    block = (np.cumsum(load) - load) // max(budget, 1)
+    starts = np.flatnonzero(np.r_[True, block[1:] != block[:-1]])
+    return list(zip(starts.tolist(), np.r_[starts[1:], len(load)].tolist()))
+
+
 class Featurizer:
     """Candidats et features ; attributs statiques pré-calculés une fois."""
 
@@ -4598,7 +4744,45 @@ class Featurizer:
         """Candidats (row, inv, balance, src) des lignes `rows` du lot, et factures citées par client file.
 
         `pos` : positions des paiements de tout le lot ; `claimed` : réservations du moteur par facture.
+        Les lignes sont traitées par blocs de charge bornée (`CANDIDATE_PAIR_BUDGET` paires avant
+        plafonnement) : même résultat qu'en un seul passage, mémoire indépendante de la taille du lot.
         """
+        rows = np.asarray(rows, dtype=np.int64)
+        blocks = _row_blocks(self._pair_load(rows, pos, scope, as_of), CANDIDATE_PAIR_BUDGET)
+        if len(blocks) == 1:
+            return self._candidates_rows(rows, pos, alloc, scope, as_of, claimed)
+        parts = [self._candidates_rows(rows[a:b], pos, alloc, scope, as_of, claimed) for a, b in blocks]
+        c = pd.concat([p[0] for p in parts], ignore_index=True)
+        c = c.iloc[np.argsort(c["row"].to_numpy(), kind="stable")].reset_index(drop=True)
+        return c, pd.concat([p[1] for p in parts], ignore_index=True)
+
+    def _pair_load(self, rows: np.ndarray, pos: np.ndarray, scope: pd.DataFrame, as_of) -> np.ndarray:
+        """Majorant du nombre de paires examinées par ligne : factures ouvertes des débiteurs alloués,
+        factures portant une clé du libellé, factures ouvertes de même montant."""
+        cfg = self.ml.candidates
+        load = np.zeros(len(rows), dtype=np.int64)
+        index_of = pd.Series(np.arange(len(rows)), index=rows)
+        if cfg.allocated_debtors and len(scope):
+            sc = scope[scope["row"].isin(rows)]
+            if "rank" in sc.columns:
+                sc = sc[sc["rank"] <= cfg.max_debtors]
+            if len(sc):
+                debtors, d_of = np.unique(sc["debtor"].to_numpy(), return_inverse=True)
+                owner, _, _ = self.state.debtor_open_invoices_at(debtors, as_of)
+                n_open = np.bincount(owner, minlength=len(debtors))
+                np.add.at(load, index_of.loc[sc["row"].to_numpy()].to_numpy(), n_open[d_of])
+        if cfg.reference_no_window:
+            r, keys = self.ref.payment_keys.gather(pos[rows])
+            np.add.at(load, r, self.ref.key_invoices.lengths(keys))
+        if cfg.amount_exact:
+            _, balance = self.state.open_invoice_positions(as_of)
+            balance = np.sort(balance)
+            amount = self.pay_amount[pos[rows]]
+            load += np.searchsorted(balance, amount, side="right") - np.searchsorted(balance, amount, side="left")
+        return load
+
+    def _candidates_rows(self, rows: np.ndarray, pos: np.ndarray, alloc: Allocation, scope: pd.DataFrame, as_of,
+                         claimed: np.ndarray) -> tuple[pd.DataFrame, pd.DataFrame]:
         cfg = self.ml.candidates
         state = self.state
         rows = np.asarray(rows, dtype=np.int64)

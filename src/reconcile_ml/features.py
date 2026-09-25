@@ -60,6 +60,20 @@ def _group_starts(keys: np.ndarray) -> np.ndarray:
     return np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]]) if len(keys) else np.array([], dtype=np.int64)
 
 
+# Paires (paiement, facture) examinées au plus par bloc avant plafonnement : les gros débiteurs, les
+# références et montants fréquents produisent des milliers de paires par paiement.
+CANDIDATE_PAIR_BUDGET = 2_000_000
+
+
+def _row_blocks(load: np.ndarray, budget: int) -> list[tuple[int, int]]:
+    """Découpe consécutive de lignes dont la charge cumulée reste de l'ordre de `budget`."""
+    if len(load) == 0:
+        return [(0, 0)]
+    block = (np.cumsum(load) - load) // max(budget, 1)
+    starts = np.flatnonzero(np.r_[True, block[1:] != block[:-1]])
+    return list(zip(starts.tolist(), np.r_[starts[1:], len(load)].tolist()))
+
+
 class Featurizer:
     """Candidats et features ; attributs statiques pré-calculés une fois."""
 
@@ -120,7 +134,45 @@ class Featurizer:
         """Candidats (row, inv, balance, src) des lignes `rows` du lot, et factures citées par client file.
 
         `pos` : positions des paiements de tout le lot ; `claimed` : réservations du moteur par facture.
+        Les lignes sont traitées par blocs de charge bornée (`CANDIDATE_PAIR_BUDGET` paires avant
+        plafonnement) : même résultat qu'en un seul passage, mémoire indépendante de la taille du lot.
         """
+        rows = np.asarray(rows, dtype=np.int64)
+        blocks = _row_blocks(self._pair_load(rows, pos, scope, as_of), CANDIDATE_PAIR_BUDGET)
+        if len(blocks) == 1:
+            return self._candidates_rows(rows, pos, alloc, scope, as_of, claimed)
+        parts = [self._candidates_rows(rows[a:b], pos, alloc, scope, as_of, claimed) for a, b in blocks]
+        c = pd.concat([p[0] for p in parts], ignore_index=True)
+        c = c.iloc[np.argsort(c["row"].to_numpy(), kind="stable")].reset_index(drop=True)
+        return c, pd.concat([p[1] for p in parts], ignore_index=True)
+
+    def _pair_load(self, rows: np.ndarray, pos: np.ndarray, scope: pd.DataFrame, as_of) -> np.ndarray:
+        """Majorant du nombre de paires examinées par ligne : factures ouvertes des débiteurs alloués,
+        factures portant une clé du libellé, factures ouvertes de même montant."""
+        cfg = self.ml.candidates
+        load = np.zeros(len(rows), dtype=np.int64)
+        index_of = pd.Series(np.arange(len(rows)), index=rows)
+        if cfg.allocated_debtors and len(scope):
+            sc = scope[scope["row"].isin(rows)]
+            if "rank" in sc.columns:
+                sc = sc[sc["rank"] <= cfg.max_debtors]
+            if len(sc):
+                debtors, d_of = np.unique(sc["debtor"].to_numpy(), return_inverse=True)
+                owner, _, _ = self.state.debtor_open_invoices_at(debtors, as_of)
+                n_open = np.bincount(owner, minlength=len(debtors))
+                np.add.at(load, index_of.loc[sc["row"].to_numpy()].to_numpy(), n_open[d_of])
+        if cfg.reference_no_window:
+            r, keys = self.ref.payment_keys.gather(pos[rows])
+            np.add.at(load, r, self.ref.key_invoices.lengths(keys))
+        if cfg.amount_exact:
+            _, balance = self.state.open_invoice_positions(as_of)
+            balance = np.sort(balance)
+            amount = self.pay_amount[pos[rows]]
+            load += np.searchsorted(balance, amount, side="right") - np.searchsorted(balance, amount, side="left")
+        return load
+
+    def _candidates_rows(self, rows: np.ndarray, pos: np.ndarray, alloc: Allocation, scope: pd.DataFrame, as_of,
+                         claimed: np.ndarray) -> tuple[pd.DataFrame, pd.DataFrame]:
         cfg = self.ml.candidates
         state = self.state
         rows = np.asarray(rows, dtype=np.int64)

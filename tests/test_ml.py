@@ -136,3 +136,14 @@ def test_pipeline_runs_without_leak(trained):
                               start, end)
     days = [d for d in full if d.date() <= cutoff_day]
     assert [full[d] for d in days] == [cut[d] for d in days]
+
+
+def test_candidates_in_blocks_match_single_pass(trained, monkeypatch):
+    """Découpage du lot par charge de paires : décisions identiques à un passage unique."""
+    import src.reconcile_ml.features as features
+    data, settings, model, _ = trained
+    start, end = date(2024, 11, 5), date(2024, 11, 8)
+    whole, _ = _pipeline_hashes(data, settings, model, start, end)
+    monkeypatch.setattr(features, "CANDIDATE_PAIR_BUDGET", 500)
+    blocks, _ = _pipeline_hashes(data, settings, model, start, end)
+    assert whole == blocks

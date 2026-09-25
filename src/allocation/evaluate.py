@@ -16,7 +16,9 @@ from src.allocation.allocator import Allocator, FIRM, NONE, SIGNALS
 from src.evaluation.metrics import _tuples_by_key
 from src.timeline.loop import DayContext, empty_decisions
 
-_COMPACT_EVERY = 30
+# Le dernier passage de chaque paiement est dédoublonné tous les N jours : sans cela, les lots successifs
+# (reliquat compris) s'accumulent en mémoire.
+_COMPACT_EVERY = 5
 
 
 class AllocationProbe:

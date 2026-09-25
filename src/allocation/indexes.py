@@ -67,22 +67,64 @@ class Postings:
         return owner, self.values[starts + np.arange(total)]
 
 
+def _hash(values: np.ndarray) -> np.ndarray:
+    """Empreintes 64 bits déterministes de chaînes (valeurs nulles : 0, jamais dans un vocabulaire)."""
+    values = np.asarray(values, dtype=object)
+    if len(values) == 0:
+        return np.array([], dtype=np.uint64)
+    return pd.util.hash_array(values, categorize=False)
+
+
 class Vocabulary:
-    """Chaînes → identifiants entiers (−1 si inconnue)."""
+    """Chaînes → identifiants entiers (−1 si inconnue).
+
+    Stocke les empreintes 64 bits triées des chaînes, pas les chaînes : quelques octets par entrée
+    au lieu d'un objet Python et d'une table de hachage pandas. Une collision entre deux clés
+    distinctes (probabilité ~ n² / 2⁶⁵, soit 10⁻⁵ pour 30 millions de clés) les confondrait.
+    """
 
     def __init__(self, values: np.ndarray):
-        codes, uniques = pd.factorize(values)
-        self.codes = codes.astype(np.int64)
-        self.index = pd.Index(np.asarray(uniques, dtype=object), dtype=object)
-        self.lengths = np.fromiter((len(v) for v in self.index), dtype=np.int64, count=len(self.index))
+        values = np.asarray(values, dtype=object)
+        valid = ~pd.isna(values)
+        hashes = _hash(values[valid])
+        self.hashes, first, inverse = np.unique(hashes, return_index=True, return_inverse=True)
+        self.codes = np.full(len(values), -1, dtype=np.int64)
+        self.codes[valid] = inverse
+        kept = values[valid][first]
+        self.lengths = np.fromiter((len(v) for v in kept), dtype=np.int64, count=len(kept))
 
     def __len__(self) -> int:
-        return len(self.index)
+        return len(self.hashes)
 
     def lookup(self, values: np.ndarray) -> np.ndarray:
-        if len(values) == 0:
-            return np.array([], dtype=np.int64)
-        return self.index.get_indexer(values).astype(np.int64)
+        values = np.asarray(values, dtype=object)
+        out = np.full(len(values), -1, dtype=np.int64)
+        if len(values) == 0 or len(self.hashes) == 0:
+            return out
+        valid = ~pd.isna(values)
+        h = _hash(values[valid])
+        i = np.minimum(np.searchsorted(self.hashes, h), len(self.hashes) - 1)
+        out[valid] = np.where(self.hashes[i] == h, i, -1)
+        return out
+
+
+# Les listes de clés / termes des libellés sont traduites par blocs : pas de copie en objets Python
+# de tous les libellés de l'historique à la fois.
+_PAYMENT_CHUNK = 200_000
+
+
+def _payment_postings(n: int, ids_of_chunk) -> Postings:
+    """Paiement → identifiants, construits par blocs de `_PAYMENT_CHUNK` paiements.
+
+    `ids_of_chunk(start, end)` rend (propriétaire relatif au bloc, identifiant) ; −1 = hors vocabulaire.
+    """
+    owners, ids = [np.array([], dtype=np.int64)], [np.array([], dtype=np.int64)]
+    for start in range(0, n, _PAYMENT_CHUNK):
+        o, i = ids_of_chunk(start, min(start + _PAYMENT_CHUNK, n))
+        known = i >= 0
+        owners.append(o[known] + start)
+        ids.append(i[known])
+    return Postings.build(np.concatenate(owners), np.concatenate(ids), n)
 
 
 class ReferenceIndex:
@@ -97,8 +139,13 @@ class ReferenceIndex:
         flat = np.concatenate([p[1] for p in parts])
         self.vocab = Vocabulary(flat)
         self.key_invoices = Postings.build(self.vocab.codes, inv_pos, len(self.vocab))
-        lengths, flat = _flatten(payments["label_numbers"])
-        self.payment_keys = Postings.from_lists(lengths, self.vocab.lookup(flat))
+        numbers = payments["label_numbers"]
+
+        def keys_of(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+            lengths, flat = _flatten(numbers.iloc[start:end])
+            return np.repeat(np.arange(end - start), lengths), self.vocab.lookup(flat)
+
+        self.payment_keys = _payment_postings(len(payments), keys_of)
 
     def key_ids(self, keys) -> np.ndarray:
         return self.vocab.lookup(np.asarray(list(keys), dtype=object))
@@ -136,8 +183,13 @@ class NameIndex:
         self.term_debtors = Postings.build(self.vocab.codes, owners, len(self.vocab))
         self.debtor_terms = Postings.build(owners, self.vocab.codes, len(debtors))
         # Termes du libellé, restreints au vocabulaire des noms.
-        owners, terms = terms_by_owner(payments["label_norm"], min_length)
-        self.payment_terms = Postings.build(owners, self.vocab.lookup(terms), len(payments))
+        labels = payments["label_norm"]
+
+        def terms_of(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+            o, t = terms_by_owner(labels.iloc[start:end].reset_index(drop=True), min_length)
+            return o, self.vocab.lookup(t)
+
+        self.payment_terms = _payment_postings(len(payments), terms_of)
 
 
 def party_ibans(debtors: pd.DataFrame, assignors: pd.DataFrame, party_iban: pd.DataFrame | None) -> pd.DataFrame:

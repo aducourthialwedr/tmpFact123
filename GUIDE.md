@@ -386,6 +386,29 @@ Choix à connaître :
 Mémoire : ~6 Go au chargement, ~11 Go à l'apprentissage. La normalisation est parallélisée
 (`load.workers`, sans effet sur le résultat).
 
+**Subtilité mémoire (données réelles).** Les données réelles contiennent des gros débiteurs (des
+dizaines de milliers de factures ouvertes), des références génériques (numéro de commande, année) et
+des montants ronds. Avec elles, une jointure « paiements du lot × factures d'une clé / d'un montant /
+d'un débiteur » peut atteindre des milliards de lignes. Le synthétique ne reproduit pas ce cas. Règles
+tenues dans le code :
+
+- **Allocation.**
+  - Le lot est traité par blocs de `CHUNK_ROWS` paiements (`src/allocation/allocator.py`).
+  - Les clés passent par la table dédoublonnée clé → débiteurs, et une jointure (clé, montant) garde
+    les correspondances exactes.
+  - Les montants passent par une recherche dichotomique dans les couples (montant, débiteur) triés.
+  - La corroboration nom + montant proche passe par une recherche par intervalle.
+- **Règles R2/R3/R5.** La jointure se fait d'abord avec la portée (quelques débiteurs par paiement),
+  puis au plus deux factures par (clé ou montant, débiteur), ce qui suffit à établir l'ambiguïté.
+- **Candidats ML.** Le lot est découpé selon un majorant du nombre de paires examinées
+  (`CANDIDATE_PAIR_BUDGET`, `src/reconcile_ml/features.py`).
+- **Vocabulaires.** Les références, les mots de nom et les IBAN sont stockés sous forme d'empreintes
+  64 bits triées, et non comme des chaînes Python. Les libellés sont traduits par blocs.
+
+Toutes ces optimisations donnent des résultats identiques, ce que vérifient des tests (passage en
+blocs = passage unique). À préserver : ne jamais joindre un lot sur une clé non sélective (montant,
+clé de référence, débiteur) sans borne préalable.
+
 Pour itérer vite : travailler à 50 000 paiements (quelques minutes de bout en bout), puis valider à
 2 M.
 
