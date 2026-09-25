@@ -30,6 +30,7 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
+from src import memory
 from src.timeline.state import DAY_US, LedgerState, _to_us
 
 AUTO, REVIEW, REJECT = "auto", "review", "reject"
@@ -173,6 +174,7 @@ def run_replay(state: LedgerState, matcher: Matcher, start: date, end: date, ret
     frames, daily = [], []
     for ctx in it:
         t = time.perf_counter()
+        memory.mark_day(ctx.day, len(ctx.batch))
         dec = _validate(matcher.process(ctx), ctx)
         it.resolve(dec.loc[dec["action"] == AUTO, "payment_id"].unique())
         if len(dec):
@@ -182,6 +184,7 @@ def run_replay(state: LedgerState, matcher: Matcher, start: date, end: date, ret
                "review": int(dec.loc[dec["action"] == REVIEW, "payment_id"].nunique()),
                "seconds": round(time.perf_counter() - t, 4)}
         daily.append(row)
+        memory.end_day()
         if on_day is not None:
             on_day(ctx, row)
     decisions = pd.concat(frames, ignore_index=True) if frames else empty_decisions().assign(

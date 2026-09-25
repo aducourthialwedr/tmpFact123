@@ -413,7 +413,20 @@ tenues dans le code :
   64 bits triées, et non comme des chaînes Python. Les libellés sont traduits par blocs.
 
 Toutes ces optimisations donnent des résultats identiques, ce que vérifient des tests (passage en
-blocs = passage unique). À préserver : ne jamais joindre un lot sur une clé non sélective (montant,
+blocs = passage unique).
+
+**Suivi mémoire** (`src/memory.py`, section « Suivi de la mémoire » du notebook). `MemoryMonitor` relève
+chaque seconde :
+- la RSS du processus ;
+- la mémoire du pod (cgroup v1/v2), dont la mémoire anonyme, ce que l'OOM killer compte, et la limite ;
+- la phase en cours : étape, jour, sous-étape.
+
+Ces phases sont posées par `memory.mark*` dans l'allocateur, les règles, le ML et la boucle
+quotidienne. Chaque relevé est écrit et vidé immédiatement dans `reports/memory.csv`. Après un kill
+OOM, `memory.by_phase(path)` donne donc, dans un nouveau noyau, la sous-étape et le jour du pic.
+
+À la fin de chaque jour, `malloc_trim` rend au système la mémoire libérée. Les tailles de blocs
+(`CHUNK_ROWS`, `CANDIDATE_PAIR_BUDGET`, `FEATURE_BLOCK_PAIRS`) se règlent depuis le notebook. À préserver : ne jamais joindre un lot sur une clé non sélective (montant,
 clé de référence, débiteur) sans borne préalable.
 
 Pour itérer vite : travailler à 50 000 paiements (quelques minutes de bout en bout), puis valider à

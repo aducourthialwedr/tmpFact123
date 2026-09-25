@@ -26,11 +26,48 @@ import altair as alt
 import pandas as pd
 from IPython.display import Markdown, display
 
+from src import memory
 from src.api import Project
 
 pd.set_option("display.max_columns", 50)
-project = Project(dataset="synthetic", log=print)
+MEMORY_LOG = ROOT / "reports" / "memory.csv"
 N_PAYMENTS = 50_000          # 2_000_000 pour le volume réel (≈ 1 h de bout en bout)"""),
+    ("md", """## Suivi de la mémoire
+
+La cellule suivante lance un relevé chaque seconde :
+- **RSS** : mémoire du processus ;
+- **pod** : mémoire du conteneur (cgroup), dont **anonyme**, ce que l'OOM killer compte, et la limite du pod ;
+- **phase en cours** : étape, jour du rejeu, sous-étape (signal d'allocation, règle, candidats ML…).
+
+Ce que la cellule produit :
+- une **pastille** sous la cellule, mise à jour en continu pendant l'exécution des cellules suivantes ;
+- l'état mémoire **ajouté à chaque message** de la pipeline ;
+- chaque relevé **écrit immédiatement** dans `reports/memory.csv`.
+
+**Si le pod est tué (OOM)**, le fichier reste. Relancer le noyau, exécuter la cellule des imports, puis la
+cellule « Analyse mémoire » en fin de notebook : elle donne le pic par étape / sous-étape et le jour
+concerné. Pour suivre en direct hors du notebook, ouvrir un terminal JupyterLab : `tail -f reports/memory.csv`.
+
+À la fin de chaque jour de rejeu, la mémoire libérée est rendue au système (`trim_daily`, via
+`malloc_trim`). Sans cela, sous Linux, le RSS ne redescend jamais. Autre réglage utile : lancer JupyterLab
+avec `MALLOC_ARENA_MAX=2` dans l'environnement, qui limite la fragmentation de glibc."""),
+    ("code", """monitor = memory.MemoryMonitor(MEMORY_LOG, interval=1.0, trim_daily=True).start()
+monitor.live()                                     # pastille mise à jour chaque seconde
+project = Project(dataset="synthetic", log=monitor.log)"""),
+    ("md", """### Réglages mémoire
+
+Ces tailles de blocs bornent la mémoire d'une journée, sans changer les résultats. Il faut les réduire si
+une sous-étape dépasse la limite du pod (au prix d'un peu de temps). D'autres leviers changent les
+résultats :
+- `split.retention_days` : taille du reliquat ;
+- `reconcile_ml.training.payment_sample` : part des paiements du jeu d'entraînement."""),
+    ("code", """import src.allocation.allocator as _allocation
+import src.reconcile_ml.features as _features
+import src.reconcile_ml.pipeline as _pipeline
+
+_allocation.CHUNK_ROWS = 20_000                 # paiements par bloc d'allocation
+_features.CANDIDATE_PAIR_BUDGET = 2_000_000     # paires (paiement, facture) examinées par bloc de candidats ML
+_pipeline.FEATURE_BLOCK_PAIRS = 500_000         # paires par bloc de calcul des features"""),
     ("md", "## Paramètres\n\nLecture et modification des paramètres depuis le notebook (écrits dans `config/settings.yaml`)."),
     ("code", """from src.settings import save_settings
 
@@ -87,6 +124,13 @@ rule = alt.Chart(pd.DataFrame({"y": [target]})).mark_rule(strokeDash=[4, 4]).enc
         display(Markdown(f"**{name}**"))
         display(ev[name])
 display(Markdown((project.reports_dir / "evaluation_pipeline_test.md").read_text(encoding="utf-8")))"""),
+    ("md", """## Analyse mémoire
+
+Pic par étape et sous-étape de la dernière session, et courbe dans le temps (limite du pod en rouge).
+Après un arrêt du noyau, cette cellule fonctionne seule : il suffit d'avoir exécuté la cellule des imports.
+`memory.by_phase(MEMORY_LOG, session=None)` couvre toutes les sessions."""),
+    ("code", """display(memory.by_phase(MEMORY_LOG))
+memory.chart(MEMORY_LOG)"""),
 ]
 
 

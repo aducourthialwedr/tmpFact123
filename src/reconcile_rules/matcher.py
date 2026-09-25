@@ -24,6 +24,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src import memory
 from src.allocation.allocator import Allocator
 from src.allocation.indexes import _flatten
 from src.reconcile_rules.subset import UNIQUE, exact_subset
@@ -238,6 +239,7 @@ class RulesMatcher:
         referenced = {}
         decided = np.zeros(len(pos), dtype=bool)
         for rule in self.rules:
+            memory.mark(f"règles · {rule.id}")
             scope = scopes[int(rule.params.get("firm_only", 0))]
             if rule.id == R1:
                 found = self._r1(pos, amount, alloc, as_of, scope, rule.params)

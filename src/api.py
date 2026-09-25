@@ -10,6 +10,8 @@
     project.backtest("test", matcher="pipeline")    # étapes 4 + 5 → étape 6
     project.report("pipeline", "test")              # résultats
 
+Suivi mémoire : `Project(log=MemoryMonitor(...).start().log)` (voir src/memory.py).
+
 Chaque méthode écrit ses sorties sur disque (paths de config/settings.yaml) et renvoie des
 objets affichables (DataFrame, dict). Les paramètres se lisent dans config/settings.yaml et
 config/rules.yaml, éditables à la main ou depuis l'interface.
@@ -29,6 +31,7 @@ from typing import Any
 
 import pandas as pd
 
+from src import memory
 from src.config import DEFAULT_SCHEMA_PATH, DEFAULT_SETTINGS_PATH, REPO_ROOT, read_yaml, resolve_path
 from src.settings import DEFAULT_RULES_PATH, RulesConfig, Settings, load_rules, load_settings
 
@@ -98,6 +101,7 @@ class Project:
     @contextmanager
     def _step(self, name: str, timings: dict[str, float]):
         start = time.perf_counter()
+        memory.mark_step(name)
         self.log(f"… {name}")
         yield
         timings[name] = round(time.perf_counter() - start, 1)

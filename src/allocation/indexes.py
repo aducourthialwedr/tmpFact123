@@ -103,7 +103,11 @@ class Vocabulary:
             return out
         valid = ~pd.isna(values)
         h = _hash(values[valid])
-        i = np.minimum(np.searchsorted(self.hashes, h), len(self.hashes) - 1)
+        # Requêtes triées : la recherche dichotomique parcourt alors le vocabulaire dans l'ordre (cache).
+        order = np.argsort(h, kind="stable")
+        i = np.empty(len(h), dtype=np.int64)
+        i[order] = np.searchsorted(self.hashes, h[order])
+        i = np.minimum(i, len(self.hashes) - 1)
         out[valid] = np.where(self.hashes[i] == h, i, -1)
         return out
 

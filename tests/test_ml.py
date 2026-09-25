@@ -147,3 +147,13 @@ def test_candidates_in_blocks_match_single_pass(trained, monkeypatch):
     monkeypatch.setattr(features, "CANDIDATE_PAIR_BUDGET", 500)
     blocks, _ = _pipeline_hashes(data, settings, model, start, end)
     assert whole == blocks
+
+
+def test_features_in_blocks_match_single_pass(trained, monkeypatch):
+    import src.reconcile_ml.pipeline as pipeline
+    data, settings, model, _ = trained
+    start, end = date(2024, 11, 5), date(2024, 11, 7)
+    whole, _ = _pipeline_hashes(data, settings, model, start, end)
+    monkeypatch.setattr(pipeline, "FEATURE_BLOCK_PAIRS", 300)
+    blocks, _ = _pipeline_hashes(data, settings, model, start, end)
+    assert whole == blocks

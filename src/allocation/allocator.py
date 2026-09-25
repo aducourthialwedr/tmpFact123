@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from src.allocation.indexes import IbanIndex, NameIndex, Postings, ReferenceIndex, _flatten
+from src import memory
 from src.settings import AllocationSettings
 from src.timeline.loop import DayContext
 from src.timeline.state import DAY_US, LedgerState, _days
@@ -390,11 +391,14 @@ class Allocator:
         attached = np.full(len(pos), -1, dtype=np.int64)
         cf_signal = _empty_signal()
         if self.cfg.signals.client_file.enabled and self._cf is not None:
+            memory.mark("allocation · client files")
             cf_signal, attached = self._client_file(pos, as_of)
         cf_row = cf_signal["row"].to_numpy()
         chunks = []
+        n_blocks = max(-(-len(pos) // CHUNK_ROWS), 1)
         for start in range(0, max(len(pos), 1), CHUNK_ROWS):
             end = min(start + CHUNK_ROWS, len(pos))
+            self._block = f"bloc {start // CHUNK_ROWS + 1}/{n_blocks}"
             in_chunk = (cf_row >= start) & (cf_row < end)
             cf_part = cf_signal[in_chunk].assign(row=cf_row[in_chunk] - start)
             chunks.append(self._allocate_rows(pos[start:end], batch_ids[start:end], attached[start:end],
@@ -410,16 +414,22 @@ class Allocator:
         sig = self.cfg.signals
         parts = [cf_signal]
         route = np.full(len(pos), UNKNOWN, dtype=object)
+        block = getattr(self, "_block", "")
         if len(pos):
             if sig.reference.enabled:
+                memory.mark(f"allocation · référence · {block}")
                 parts.append(self._reference(pos, as_of))
             if sig.iban.enabled:
+                memory.mark(f"allocation · IBAN · {block}")
                 iban_signal, route = self._iban(pos, as_of)
                 parts.append(iban_signal)
             if sig.name.enabled:
+                memory.mark(f"allocation · nom · {block}")
                 parts.append(self._name(pos, as_of))
             if sig.amount.enabled:
+                memory.mark(f"allocation · montant · {block}")
                 parts.append(self._amount(pos, as_of))
+        memory.mark(f"allocation · combinaison · {block}")
         signals = pd.concat([p for p in parts if len(p)], ignore_index=True) if any(len(p) for p in parts) \
             else _empty_signal()
         return self._combine(signals, batch_ids, route, attached)

@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src import memory
 from src.evaluation.metrics import ground_truth
 from src.load.interim import load_interim
 from src.reconcile_ml.decision import calibrate_online, calibrate_thresholds, decide, propose
@@ -32,6 +33,9 @@ from src.timeline.split import assign_period, compute_split
 from src.timeline.state import LedgerState, _days
 
 MODEL_DIRNAME = "pair_model"
+
+# Paires dont les features sont calculées ensemble : borne les intermédiaires d'un jour.
+FEATURE_BLOCK_PAIRS = 500_000
 
 
 def _sampled(payment_ids: np.ndarray, share: float) -> np.ndarray:
@@ -58,9 +62,29 @@ class _ResidualMixin(RulesMatcher):
         rows = np.flatnonzero(keep)
         alloc = self.last_allocation
         scope = self._scopes(alloc, batch_ids)[0]
+        memory.mark("ML · candidats")
         cands, cited = self.featurizer.candidates(rows, pos, alloc, scope, ctx.as_of, self._claimed)
-        X = self.featurizer.features(cands, pos, alloc, batch_ids, ctx.as_of, cited) if len(cands) else None
+        memory.mark(f"ML · features ({len(cands)} paires)")
+        X = self._features(cands, pos, alloc, batch_ids, ctx.as_of, cited) if len(cands) else None
         return batch_ids, pos, alloc, cands, X
+
+    def _features(self, cands, pos, alloc, batch_ids, as_of, cited) -> pd.DataFrame:
+        """Features par blocs de paiements entiers (≈ `FEATURE_BLOCK_PAIRS` paires) : mêmes valeurs,
+        intermédiaires bornés. Les candidats sont triés par paiement."""
+        row = cands["row"].to_numpy()
+        if len(row) <= FEATURE_BLOCK_PAIRS:
+            return self.featurizer.features(cands, pos, alloc, batch_ids, as_of, cited)
+        starts = np.flatnonzero(np.r_[True, row[1:] != row[:-1]])
+        cuts = np.unique(starts[np.searchsorted(starts, np.arange(0, len(row), FEATURE_BLOCK_PAIRS), side="right") - 1])
+        bounds = np.r_[cuts, len(row)]
+        parts = []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            block = cands.iloc[a:b]
+            rows = np.unique(block["row"].to_numpy())
+            sub_cited = cited[cited["row"].isin(rows)] if cited is not None and len(cited) else cited
+            parts.append(self.featurizer.features(block.reset_index(drop=True), pos, alloc, batch_ids, as_of,
+                                                  sub_cited))
+        return pd.concat(parts, ignore_index=True)
 
 
 class DatasetRecorder(_ResidualMixin):
@@ -73,6 +97,7 @@ class DatasetRecorder(_ResidualMixin):
         self._setup_ml(settings)
         self.features = active_features(self.ml)
         self._frames: list[pd.DataFrame] = []
+        self._pairs = 0
 
     def process(self, ctx: DayContext) -> pd.DataFrame:
         decisions = super().process(ctx)
@@ -87,6 +112,8 @@ class DatasetRecorder(_ResidualMixin):
             frame["payment_amount"] = self._pay_amount[pos[cands["row"].to_numpy()]]
             frame["day"] = ctx.day
             self._frames.append(frame)
+            self._pairs += len(frame)
+            memory.mark(f"jeu d'entraînement : {self._pairs} paires cumulées")
         return decisions
 
     def dataset(self) -> pd.DataFrame:
@@ -119,10 +146,12 @@ class PipelineMatcher(_ResidualMixin):
         if X is None or not len(X):
             return rules_decisions
         amount = self._pay_amount[pos]
+        memory.mark(f"ML · score ({len(X)} paires)")
         raw = self.model.raw(X, cands["row"].to_numpy())
         scored = cands.assign(p=raw, p_cal=self.model.calibrate(raw))
         self._record_diag(scored, batch_ids)
 
+        memory.mark("ML · propositions")
         props = propose(scored, amount, self.ml.sets)
         props = self._segment_columns(props, pos, alloc, X, cands)
         if self.record_proposals and len(props):
